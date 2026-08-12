@@ -1,0 +1,26 @@
+__pycache__/
+*.npz
+wandb/
+
+# checkpoints / weights
+temp_ckpts/
+*.pth
+*.pt
+*.ckpt
+
+# logs & outputs
+*.log
+runs/
+outputs/
+
+# python
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+*.egg-info/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
