@@ -12,6 +12,7 @@ temp_ckpts/
 *.log
 runs/
 outputs/
+report/
 
 # python
 *.py[cod]
