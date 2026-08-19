@@ -22,7 +22,8 @@ from utils.h36m_dataset import Human36mDataset
 
 from torch.utils.data import DataLoader
 
-from utils.loss import BoneDirectionLoss, mpjpe
+from utils.loss import (BoneDirectionLoss, BoneDirectionPerturber,
+                        GaussianPerturber, mpjpe)
 from utils.seed import set_seed
 from utils.utils import AverageMeter
 import wandb
@@ -283,6 +284,12 @@ def main(args):
         print(f"==> Bone-direction loss on {len(criterion_dir.child)} bones, "
               f"weight {args.dir_weight}")
 
+    perturber = None
+    criterion_loss_neg = None
+    neg_exclude = [0] if args.dataset == "3dhp" else []
+    if args.neg_type != "none" and args.type != "dynamic":
+        raise ValueError("--neg_type only applies to --type dynamic")
+
     if args.task_net == "linear":
         model_pos = LinearModel(
             num_joints * 2,
@@ -375,6 +382,51 @@ def main(args):
         elif args.em_loss_type == "nce":
             criterion_loss = NCELoss(temperature=args.margin_ratio)
 
+        # Synthetic negatives for the energy net. Until now its only negative
+        # was the task net's own prediction, whose error shrinks as training
+        # proceeds, so the margin collapses and the energy net ends up
+        # regressing error magnitude rather than learning structure
+        # (report/2026-08-18_bone_direction_loss.md, section 1). These add a
+        # supply at a difficulty we control, along the direction axis that holds
+        # 2.4x the headroom of length. They supplement the prediction negatives
+        # rather than replacing them: predictions carry a -18 mm bone-length
+        # contraction that synthetic poses never show, and dropping them would
+        # leave the energy net off-distribution exactly where the task net lives.
+        if args.neg_type != "none":
+            joint_mask = torch.ones(num_joints)
+            for joint in neg_exclude:
+                joint_mask[joint] = 0
+            if args.em_loss_type == "margin":
+                criterion_loss_neg = MarginBasedLoss(
+                    margin_ratio=args.margin_ratio,
+                    loss_type=args.em_loss,
+                    per_sample=True,
+                    joint_mask=joint_mask,
+                )
+            else:
+                criterion_loss_neg = NCELoss(temperature=args.margin_ratio)
+            if args.neg_type == "angle":
+                perturber = BoneDirectionPerturber(
+                    dataset.skeleton().parents(),
+                    exclude=neg_exclude,
+                    theta_min=args.neg_theta_min,
+                    theta_max=args.neg_theta_max,
+                ).to(device)
+                detail = f"theta U({args.neg_theta_min}, {args.neg_theta_max}) deg"
+            elif args.neg_type == "gauss":
+                parents = list(dataset.skeleton().parents())
+                perturber = GaussianPerturber(
+                    root=parents.index(-1),
+                    exclude=neg_exclude,
+                    sigma=args.neg_sigma,
+                ).to(device)
+                detail = f"sigma {args.neg_sigma}"
+            else:
+                print(f"Invalid neg_type: {args.neg_type}")
+                raise ValueError(f"Invalid neg_type: {args.neg_type}")
+            print(f"==> Synthetic negatives: {args.neg_type}, {detail}, "
+                  f"weight {args.neg_weight}, joints {neg_exclude} pinned to GT")
+
         if args.checkpoint_loss is not None:
             checkpoint = torch.load(args.checkpoint_loss, map_location=device)
             try:
@@ -436,6 +488,9 @@ def main(args):
         epoch_loss_energy = AverageMeter()
         epoch_loss_energy_u = AverageMeter()
         epoch_loss_dir = AverageMeter()
+        epoch_loss_neg = AverageMeter()
+        epoch_delta_neg = AverageMeter()
+        epoch_e_diff_neg = AverageMeter()
         epoch_e_diff = AverageMeter()
         epoch_loss_loss_net = AverageMeter()
         e_diffs = []
@@ -480,6 +535,10 @@ def main(args):
                     outputs_cobined = model_pos(input_combined)
                 energy_hat = model_loss(input_combined, outputs_cobined)
                 energy_label = model_loss(input_combined, target_combined)
+                if perturber is not None:
+                    with torch.no_grad():
+                        y_neg = perturber(target_combined)
+                    energy_neg = model_loss(input_combined, y_neg)
                 e_diff = energy_hat[batch_size:] - energy_label[batch_size:]
                 epoch_e_diff.update(e_diff.mean().item(), batch_size)
 
@@ -497,6 +556,20 @@ def main(args):
                     energy_hat[:batch_size],
                     energy_label[:batch_size],
                 )
+                if perturber is not None:
+                    loss_neg = criterion_loss_neg(
+                        y_neg, target_combined, energy_neg, energy_label
+                    )
+                    loss_loss_net = loss_loss_net + args.neg_weight * loss_neg
+                    epoch_loss_neg.update(loss_neg.item(), batch_size)
+                    epoch_e_diff_neg.update(
+                        (energy_neg - energy_label).mean().item(), batch_size
+                    )
+                    if hasattr(criterion_loss_neg, "delta"):
+                        epoch_delta_neg.update(
+                            criterion_loss_neg.delta(y_neg, target_combined).mean().item(),
+                            batch_size,
+                        )
                 loss_loss_net.backward()
                 optimizer_loss.step()
 
@@ -621,6 +694,13 @@ def main(args):
             if args.type != "baseline":
                 print(
                     f"  Energy loss: {epoch_loss_energy.avg:.3E}, E-diff: {epoch_e_diff.avg:.6f}, E-diff Ratio: {np.mean(e_diffs)/np.std(e_diffs):.3f}"
+                )
+            if perturber is not None:
+                print(
+                    f"  Neg ({args.neg_type}): hinge {epoch_loss_neg.avg:.6f} "
+                    f"(x{args.neg_weight} = {args.neg_weight * epoch_loss_neg.avg:.6f}), "
+                    f"delta {epoch_delta_neg.avg:.6f}, "
+                    f"E-diff {epoch_e_diff_neg.avg:.6f}"
                 )
             if criterion_dir is not None:
                 print(
@@ -819,6 +899,19 @@ if __name__ == "__main__":
     parser.add_argument("--dir_weight", type=float, default=0,
                         help="weight of the length-weighted bone-direction loss "
                              "(0 disables it); same units as the MSE term")
+    parser.add_argument("--neg_type", type=str, default="none",
+                        help="synthetic negatives for the SEAL energy net: none | "
+                             "angle (bone-direction perturbation) | gauss "
+                             "(Cartesian control, difficulty-matched to angle)")
+    parser.add_argument("--neg_weight", type=float, default=1.0,
+                        help="weight of the synthetic-negative hinge term")
+    parser.add_argument("--neg_theta_min", type=float, default=3.0,
+                        help="min bone rotation in degrees for --neg_type angle")
+    parser.add_argument("--neg_theta_max", type=float, default=15.0,
+                        help="max bone rotation in degrees for --neg_type angle")
+    parser.add_argument("--neg_sigma", type=float, default=0.01832,
+                        help="per-coordinate noise std in metres for --neg_type "
+                             "gauss; calibrated so mean delta matches angle")
     parser.add_argument("--half", type=int, default=0)
 
     args = parser.parse_args()

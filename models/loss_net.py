@@ -60,18 +60,51 @@ class LinearLossNet(nn.Module):
 
 
 class MarginBasedLoss:
-    def __init__(self, margin_ratio=1, loss_type='mse'):
+    """Hinge on the energy gap, scaled by how wrong the negative actually is.
+
+    per_sample=False keeps delta a batch scalar, which is what the prediction
+    based negatives have always used -- leave it alone so existing runs are
+    unchanged. Structured negatives need per_sample=True: their difficulty is
+    drawn per sample (both the bone count k and the angle vary, spreading delta
+    over 8-71 mm), and a batch mean would average that control away and hand
+    every sample the same margin.
+
+    joint_mask drops joints from delta. For 3DHP pass a mask that zeroes joint
+    0 -- it carries the camera-frame root trajectory and sits ~3.5 m from the
+    pelvis, so any rotation of an ancestor bone swings it by metres and the
+    margin would track camera distance instead of pose error.
+    """
+
+    def __init__(self, margin_ratio=1, loss_type='mse', per_sample=False, joint_mask=None):
         self.margin_ratio = margin_ratio
         self.loss_type = loss_type
+        self.per_sample = per_sample
+        self.joint_mask = joint_mask
+
+    def delta(self, y_hat, label):
+        if not self.per_sample:
+            if self.loss_type == 'mse':
+                return nn.MSELoss()(y_hat, label)
+            elif self.loss_type == 'mpjpe':
+                return mpjpe(y_hat, label)
+            elif self.loss_type == 'l1':
+                return nn.L1Loss()(y_hat, label)
+
+        diff = y_hat.view(y_hat.shape[0], -1, 3) - label.view(label.shape[0], -1, 3)
+        if self.loss_type == 'mpjpe':
+            per_joint = diff.norm(dim=-1)                     # (B, J)
+        elif self.loss_type == 'l1':
+            per_joint = diff.abs().mean(-1)
+        else:
+            per_joint = diff.pow(2).mean(-1)
+        if self.joint_mask is None:
+            return per_joint.mean(-1, keepdim=True)           # (B, 1)
+        weight = self.joint_mask.to(per_joint.device)
+        return (per_joint * weight).sum(-1, keepdim=True) / weight.sum().clamp_min(1)
 
     def __call__(self, y_hat, label, energy_hat, energy_label):
-        if self.loss_type == 'mse':
-            delta = nn.MSELoss()(y_hat, label)
-        elif self.loss_type == 'mpjpe':
-            delta = mpjpe(y_hat, label)
-        elif self.loss_type == 'l1':
-            delta = nn.L1Loss()(y_hat, label)
-        
+        delta = self.delta(y_hat, label)
+
         if self.margin_ratio < 0:
             margin_based_loss = - energy_hat + energy_label
         else:

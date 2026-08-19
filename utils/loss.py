@@ -1,5 +1,7 @@
 from __future__ import absolute_import, division
 
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -103,6 +105,136 @@ class BoneDirectionLoss(nn.Module):
 
         d2 = ((up - ut) * lt).pow(2).sum(-1)                     # (B, n_bones)
         return (d2 * self.weight).sum(-1).mean() / (3.0 * self.weight.sum())
+
+
+class BoneDirectionPerturber(nn.Module):
+    """Angle-controlled structured negative sampler for the SEAL energy net.
+
+    Decomposes the ground truth into (root, per-bone unit direction, per-bone
+    length), rotates a random subset of the directions by a controlled angle,
+    and reassembles by forward kinematics with the ground-truth lengths. The
+    result is a pose whose bone lengths are exactly right but whose directions
+    are wrong by a known amount -- the negative counterpart of what
+    BoneDirectionLoss measures.
+
+    Displacement follows the same model as the loss term: rotating bone b by
+    theta translates every joint below it by d_b = l_b * (u_hat_b - u_b), so a
+    single-bone perturbation costs c_b * ||d_b|| / n_joints of MPJPE. At
+    theta = 9 deg that spans 0.87 mm (neck-head, c_b = 1) to 20.6 mm
+    (pelvis-spine, c_b = 9) on 3DHP -- a 24x spread, which is why the margin
+    downstream has to be per sample.
+
+    Per sample, k ~ U{1..n_bones} bones are drawn uniformly and each gets an
+    independent theta ~ U(theta_min, theta_max) about a random axis
+    perpendicular to the bone. k is randomised because the margin is computed
+    per sample, so every k is self-consistent and there is no reason to fix one;
+    the resulting delta spans 10-64 mm (p10-p90) with the task net's own error
+    (54.65 mm) at p77, i.e. hard and coarse negatives in one distribution.
+
+    Bones are drawn uniformly and NOT weighted by c_b. c_b weighting only
+    shifts difficulty (mean delta 7.1 -> 11.1 mm at k = 1), which k already
+    controls, while starving the terminal bones -- forearms carry the largest
+    residual angle error (p99 65-70 deg) and are exactly the headroom the c_b
+    weighted loss term failed to reach.
+
+    Defaults are the ones measured in report/2026-08-18_bone_direction_loss.md
+    against that report's angle-error distribution (p50 5.1 / p90 14.8 deg).
+
+    Args:
+        parents:    parent index per joint, -1 for the root.
+        exclude:    joints to pin to the ground truth and never perturb. For
+                    3DHP pass [0] -- it holds the camera-frame root trajectory
+                    (~3.5 m from the pelvis), not a body joint.
+        theta_min:  smallest bone rotation, degrees.
+        theta_max:  largest bone rotation, degrees.
+    """
+
+    def __init__(self, parents, exclude=(), theta_min=3.0, theta_max=15.0):
+        super(BoneDirectionPerturber, self).__init__()
+        parents = list(parents)
+        exclude = set(exclude)
+        bones = [j for j, p in enumerate(parents)
+                 if p != -1 and j not in exclude and p not in exclude]
+        index = {j: i for i, j in enumerate(bones)}
+
+        # Forward-kinematics order: a bone can only be placed once its parent is.
+        placed = {j for j, p in enumerate(parents) if p == -1} | exclude
+        order = []
+        while len(order) < len(bones):
+            progressed = False
+            for j in bones:
+                if j not in placed and parents[j] in placed:
+                    order.append(j)
+                    placed.add(j)
+                    progressed = True
+            if not progressed:
+                raise ValueError("skeleton parents do not form a tree")
+
+        # Joints never written by the loop (root, excluded) keep their ground
+        # truth value, which is what pins the root at the origin.
+        self._fk = [(j, parents[j], index[j]) for j in order]
+        self.register_buffer("child", torch.as_tensor(bones, dtype=torch.long))
+        self.register_buffer("parent", torch.as_tensor([parents[j] for j in bones],
+                                                       dtype=torch.long))
+        self.theta_min = theta_min
+        self.theta_max = theta_max
+        self.eps = 1e-6
+
+    def forward(self, target):
+        shape = target.shape
+        target = target.view(shape[0], -1, 3)
+        batch, n_bones = target.shape[0], self.child.numel()
+
+        v = target[:, self.child] - target[:, self.parent]
+        lt = v.norm(dim=-1, keepdim=True)
+        ut = v / lt.clamp_min(self.eps)
+
+        axis = torch.randn_like(ut)                              # random axis _|_ bone
+        axis = axis - (axis * ut).sum(-1, keepdim=True) * ut
+        axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+
+        # exactly k bones per sample, drawn uniformly without replacement
+        k = torch.randint(1, n_bones + 1, (batch, 1), device=target.device)
+        rank = torch.rand(batch, n_bones, device=target.device).argsort(-1).argsort(-1)
+        mask = (rank < k).to(target.dtype)
+
+        lo, hi = math.radians(self.theta_min), math.radians(self.theta_max)
+        theta = (lo + (hi - lo) * torch.rand(batch, n_bones, device=target.device)) * mask
+        theta = theta.unsqueeze(-1)
+        up = ut * torch.cos(theta) + axis * torch.sin(theta)     # Rodrigues, axis _|_ ut
+
+        out = target.clone()
+        for joint, parent, i in self._fk:
+            out[:, joint] = out[:, parent] + up[:, i] * lt[:, i]
+        return out.view(shape)
+
+
+class GaussianPerturber(nn.Module):
+    """Unstructured control for BoneDirectionPerturber.
+
+    Adds isotropic Cartesian noise, re-centres on the root and pins the excluded
+    joints, so it differs from the structured sampler in exactly one respect:
+    whether the corruption respects the skeleton. sigma has to be calibrated so
+    the mean delta matches the structured sampler's -- otherwise the two arms
+    differ in difficulty as well as in structure and the comparison cannot
+    separate the two. The default matches k ~ U{1..15}, theta ~ U(3, 15) on
+    3DHP; report/check_negatives.py re-derives it.
+    """
+
+    def __init__(self, root, exclude=(), sigma=0.01832):
+        super(GaussianPerturber, self).__init__()
+        self.root = int(root)
+        self.exclude = sorted(int(j) for j in set(exclude))
+        self.sigma = sigma
+
+    def forward(self, target):
+        shape = target.shape
+        target = target.view(shape[0], -1, 3)
+        out = target + torch.randn_like(target) * self.sigma
+        out = out - out[:, self.root:self.root + 1]
+        for joint in self.exclude:
+            out[:, joint] = target[:, joint]
+        return out.view(shape)
 
 
 def mpjpe(predicted, target):
