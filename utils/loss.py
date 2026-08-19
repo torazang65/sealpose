@@ -35,6 +35,76 @@ def test_score(predict_list, target_list, verbose=True):
     return (count[0], count[1], count[2], count[3], count[4], count[5] / 2)
 
 
+class BoneDirectionLoss(nn.Module):
+    """Length-weighted squared error of each bone's direction.
+
+    For bone b = (joint j, its parent), with GT length l_b and unit vectors
+    u_hat_b / u_b, the direction-only displacement is
+
+        d_b = l_b * (u_hat_b - u_b),      ||d_b|| = 2 * l_b * sin(theta_b / 2)
+
+    i.e. exactly the positional error that survives when the bone length is
+    correct but the direction is not. l_b comes from the ground truth, so it
+    acts as a constant weight: this term has zero gradient with respect to
+    predicted bone length and only supervises direction.
+
+    Bones are weighted by c_b = 1 + (number of joints hanging off b), which is
+    the weight position-MSE already gives a bone's direction implicitly -- a
+    direction error there displaces every descendant. Keeping c_b therefore
+    preserves the spatial weighting of the MSE term and only raises the
+    direction half relative to the length half, which is what the headroom
+    measurement in report/check_bodyness.py calls for (direction -21.98 mm vs
+    length -9.09 mm on gcn-base-d095).
+
+    Normalised per coordinate, so it is directly comparable to
+    nn.MSELoss(reduction="mean") and a weight of 1.0 puts the two on an equal
+    footing.
+
+    Args:
+        parents:  parent index per joint, -1 for the root.
+        exclude:  joints to drop. For 3DHP pass [0] -- ground truth puts joint 0
+                  1.2-6.3 m from the head, so it is not a body joint, and an
+                  l^2 weight would hand it ~42x the weight of a femur.
+    """
+
+    def __init__(self, parents, exclude=()):
+        super(BoneDirectionLoss, self).__init__()
+        parents = list(parents)
+        exclude = set(exclude)
+        bones = [j for j, p in enumerate(parents)
+                 if p != -1 and j not in exclude and p not in exclude]
+
+        def num_descendants(j):
+            n, stack = 0, [j]
+            while stack:
+                cur = stack.pop()
+                kids = [k for k in bones if parents[k] == cur]
+                n += len(kids)
+                stack += kids
+            return n
+
+        self.register_buffer("child", torch.as_tensor(bones, dtype=torch.long))
+        self.register_buffer("parent", torch.as_tensor([parents[j] for j in bones],
+                                                       dtype=torch.long))
+        self.register_buffer("weight", torch.as_tensor(
+            [1.0 + num_descendants(j) for j in bones], dtype=torch.float32))
+        self.eps = 1e-6
+
+    def forward(self, predicted, target):
+        predicted = predicted.view(predicted.shape[0], -1, 3)
+        target = target.view(target.shape[0], -1, 3)
+
+        vp = predicted[:, self.child] - predicted[:, self.parent]
+        vt = target[:, self.child] - target[:, self.parent]
+
+        lt = vt.norm(dim=-1, keepdim=True)                       # GT length: constant
+        up = vp / vp.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+        ut = vt / lt.clamp_min(self.eps)
+
+        d2 = ((up - ut) * lt).pow(2).sum(-1)                     # (B, n_bones)
+        return (d2 * self.weight).sum(-1).mean() / (3.0 * self.weight.sum())
+
+
 def mpjpe(predicted, target):
     """
     Mean per-joint position error (i.e. mean Euclidean distance),

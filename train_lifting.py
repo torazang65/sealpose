@@ -22,7 +22,7 @@ from utils.h36m_dataset import Human36mDataset
 
 from torch.utils.data import DataLoader
 
-from utils.loss import mpjpe
+from utils.loss import BoneDirectionLoss, mpjpe
 from utils.seed import set_seed
 from utils.utils import AverageMeter
 import wandb
@@ -255,6 +255,18 @@ def main(args):
     num_joints = dataset.skeleton().num_joints()
     print(f"==> Number of joints: {num_joints}")
 
+    # Length-weighted bone-direction term (report/check_bodyness.py, section 7).
+    # 3DHP's joint 0 sits 1.2-6.3 m from the head in the ground truth, so it is
+    # not a body joint and is dropped from the bone set.
+    criterion_dir = None
+    if args.dir_weight > 0:
+        criterion_dir = BoneDirectionLoss(
+            dataset.skeleton().parents(),
+            exclude=[0] if args.dataset == "3dhp" else [],
+        ).to(device)
+        print(f"==> Bone-direction loss on {len(criterion_dir.child)} bones, "
+              f"weight {args.dir_weight}")
+
     if args.task_net == "linear":
         model_pos = LinearModel(
             num_joints * 2,
@@ -402,6 +414,7 @@ def main(args):
         epoch_loss_3d_pos = AverageMeter()
         epoch_loss_energy = AverageMeter()
         epoch_loss_energy_u = AverageMeter()
+        epoch_loss_dir = AverageMeter()
         epoch_e_diff = AverageMeter()
         epoch_loss_loss_net = AverageMeter()
         e_diffs = []
@@ -427,8 +440,15 @@ def main(args):
                 outputs_3d = model_pos(inputs_2d)
                 optimizer.zero_grad()
                 loss_3d_pos = criterion(outputs_3d, targets_3d)
-                loss_3d_pos.backward()
                 epoch_loss_3d_pos.update(loss_3d_pos.item(), batch_size)
+
+                loss_total = loss_3d_pos
+                if criterion_dir is not None:
+                    loss_dir = criterion_dir(outputs_3d, targets_3d)
+                    epoch_loss_dir.update(loss_dir.item(), batch_size)
+                    loss_total = loss_total + args.dir_weight * loss_dir
+
+                loss_total.backward()
                 optimizer.step()
             elif args.type == "dynamic":
                 # update loss net
@@ -588,6 +608,11 @@ def main(args):
             if args.type != "baseline":
                 print(
                     f"  Energy loss: {epoch_loss_energy.avg:.3E}, E-diff: {epoch_e_diff.avg:.6f}, E-diff Ratio: {np.mean(e_diffs)/np.std(e_diffs):.3f}"
+                )
+            if criterion_dir is not None:
+                print(
+                    f"  Dir loss: {epoch_loss_dir.avg:.6f} (x{args.dir_weight} = "
+                    f"{args.dir_weight * epoch_loss_dir.avg:.6f}), pos loss: {epoch_loss_3d_pos.avg:.6f}"
                 )
             print(
                 f"{args.dataset}: Protocol #1   (MPJPE) overall average: {error_h3wb_p1:.2f} (mm)"
@@ -778,6 +803,9 @@ if __name__ == "__main__":
     parser.add_argument("--centering", type=str, default=None)
     parser.add_argument("--mse_weight", type=float, default=1)
     parser.add_argument("--lr_decay", type=float, default=1)
+    parser.add_argument("--dir_weight", type=float, default=0,
+                        help="weight of the length-weighted bone-direction loss "
+                             "(0 disables it); same units as the MSE term")
     parser.add_argument("--half", type=int, default=0)
 
     args = parser.parse_args()
