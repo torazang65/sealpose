@@ -246,6 +246,22 @@ def main(args):
         raise ValueError(f"Invalid dataset: {args.dataset}")
     is_h3wb = args.dataset == "h3wb"
 
+    def center(poses):
+        """Move a batch of ground-truth poses into the model's output frame.
+
+        The loaders hand back raw stored poses -- read_3d_data_3dhp passes
+        positions through untouched and read_3d_data has its centering commented
+        out with "remove at model training" -- so every ground-truth batch has to
+        be centred here, not just the task net's. On 3DHP the raw frame puts the
+        root 0.71 m off the origin, so a batch that misses this sits 713 mm from
+        the model's output space, 13x the task net's own error.
+        """
+        if args.dataset == "3dhp":
+            return poses - poses[:, 14:15, :]        # 14 is the pelvis
+        if not is_h3wb or args.centering == "zero":
+            return poses - poses[:, :1, :]
+        return poses - (poses[:, 11:12, :] + poses[:, 12:13, :]) / 2
+
     print("==> Data loaded...")
     device = get_device()
     if args.pos_loss == "mse":
@@ -408,6 +424,11 @@ def main(args):
     lr_task_net = args.lr
     
     set_seed(args.seed)
+    # One iterator for the whole run. next(iter(loader)) rebuilds the sampler on
+    # every call, and RandomSampler materialises a permutation of all 1.84M
+    # training poses (~136 ms) to use 1024 of them -- the dominant term in SEAL's
+    # 4.4x wall-clock over baseline.
+    loss_iter = iter(train_loader_loss)
 
     while True:
         # for epoch in range(1, epochs + 1):
@@ -422,20 +443,7 @@ def main(args):
         for i, batch in enumerate(tqdm(train_loader)):
             targets_3d, inputs_2d = batch[0].to(device), batch[1].to(device)
             batch_size = targets_3d.size(0)
-            if args.dataset == "3dhp":
-                # 14:15
-                targets_3d = (
-                    targets_3d[:, :, :] - targets_3d[:, 14:15, :]
-                )  # the output is relative to the 0 joint
-            elif not is_h3wb or args.centering == "zero":
-                targets_3d = (
-                    targets_3d[:, :, :] - targets_3d[:, :1, :]
-                )  # the output is relative to the 0 joint
-            elif is_h3wb and args.centering == "hip":
-                targets_3d = (
-                    targets_3d[:, :, :]
-                    - (targets_3d[:, 11:12, :] + targets_3d[:, 12:13, :]) / 2
-                )
+            targets_3d = center(targets_3d)
             if args.type == "baseline":
                 outputs_3d = model_pos(inputs_2d)
                 optimizer.zero_grad()
@@ -456,10 +464,15 @@ def main(args):
                 if args.task_eval_during_dynamic:
                     model_pos.eval()
 
-                loss_batch = next(iter(train_loader_loss))
+                try:
+                    loss_batch = next(loss_iter)
+                except StopIteration:
+                    loss_iter = iter(train_loader_loss)
+                    loss_batch = next(loss_iter)
                 targets_3d_l, inputs_2d_l = loss_batch[0].to(device), loss_batch[1].to(
                     device
                 )
+                targets_3d_l = center(targets_3d_l)
 
                 with torch.no_grad():
                     input_combined = torch.cat([inputs_2d, inputs_2d_l], dim=0)
