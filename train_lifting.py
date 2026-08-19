@@ -480,7 +480,12 @@ def main(args):
     # every call, and RandomSampler materialises a permutation of all 1.84M
     # training poses (~136 ms) to use 1024 of them -- the dominant term in SEAL's
     # 4.4x wall-clock over baseline.
-    loss_iter = iter(train_loader_loss)
+    #
+    # Only for the runs that consume it. iter() draws a seed for the sampler's
+    # generator off the global RNG, so building it unconditionally would shift
+    # the stream for baseline runs, which never touch this loader, and they
+    # would stop reproducing the numbers they were tuned against.
+    loss_iter = iter(train_loader_loss) if args.type != "baseline" else None
 
     while True:
         # for epoch in range(1, epochs + 1):
