@@ -34,11 +34,41 @@ def read_3d_data(dataset):
     return dataset
 
 
-def read_3d_data_3dhp(dataset):
+def _restore_head_top(poses):
+    """Put slot 0 back where head_top actually is: the origin of its own frame.
+
+    data/prepare_data_mpi_inf_3dhp.py:489 subtracts slot 0 from slots 1..16 and
+    leaves slot 0 itself alone ("keep trajectory in first position"), so the
+    stored pose is 16 head_top-relative body joints plus one absolute
+    camera-frame position. In that frame head_top sits at exactly 0, which is
+    what this writes back -- an exact reconstruction, not an estimate.
+
+    Written in place. positions_3d aliases positions in the caller, so the two
+    were never independent, and zeroing twice is a no-op.
+    """
+    poses[:, 0] = 0
+    return poses
+
+
+def read_3d_data_3dhp(dataset, restore_head_top=False):
+    """Expose the stored 3DHP poses as positions_3d.
+
+    restore_head_top turns slot 0 from the camera-frame trajectory into the real
+    head_top joint. Leave it off to reproduce every result recorded before this
+    flag existed: the trajectory carries ~3.3 m of camera distance, which is 40%
+    of the position MSE and 11.7% of the reported MPJPE, so the two settings are
+    not comparable.
+    """
     for subject in dataset.subjects():
         for action in dataset[subject].keys():
             anim = dataset[subject][action]
-            anim['positions_3d'] = anim['positions']
+            positions = anim['positions']
+            if restore_head_top:
+                if isinstance(positions, (list, tuple)):
+                    positions = [_restore_head_top(p) for p in positions]
+                else:
+                    positions = _restore_head_top(positions)
+            anim['positions_3d'] = positions
     return dataset
 
 

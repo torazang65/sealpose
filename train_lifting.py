@@ -183,7 +183,7 @@ def prepare_data_3dhp(args, data_path):
     subjects_test = ["TS1", "TS2", "TS3", "TS4"]
     print("==> Preparing data...")
     h36m_dataset = MpiInf3dhpDataset(data_path)
-    dataset = read_3d_data_3dhp(h36m_dataset)
+    dataset = read_3d_data_3dhp(h36m_dataset, restore_head_top=args.restore_head_top)
     print("==> Loading 2D detections...")
     stride = 1
     action_filter = None
@@ -272,21 +272,29 @@ def main(args):
     num_joints = dataset.skeleton().num_joints()
     print(f"==> Number of joints: {num_joints}")
 
+    # 3DHP stores the camera-frame trajectory in slot 0 instead of head_top, so
+    # that slot holds 1.2-6.3 m of camera distance rather than a body joint and
+    # every skeleton-aware term has to drop it. --restore_head_top puts the real
+    # joint back, at which point there is nothing to exclude.
+    trajectory_joint = []
+    if args.dataset == "3dhp" and not args.restore_head_top:
+        trajectory_joint = [0]
+    if args.dataset == "3dhp":
+        print(f"==> Joint 0: {'head_top (restored)' if args.restore_head_top else 'camera trajectory (excluded from structural terms)'}")
+
     # Length-weighted bone-direction term (report/check_bodyness.py, section 7).
-    # 3DHP's joint 0 sits 1.2-6.3 m from the head in the ground truth, so it is
-    # not a body joint and is dropped from the bone set.
     criterion_dir = None
     if args.dir_weight > 0:
         criterion_dir = BoneDirectionLoss(
             dataset.skeleton().parents(),
-            exclude=[0] if args.dataset == "3dhp" else [],
+            exclude=trajectory_joint,
         ).to(device)
         print(f"==> Bone-direction loss on {len(criterion_dir.child)} bones, "
               f"weight {args.dir_weight}")
 
     perturber = None
     criterion_loss_neg = None
-    neg_exclude = [0] if args.dataset == "3dhp" else []
+    neg_exclude = list(trajectory_joint)
     if args.neg_type != "none" and args.type != "dynamic":
         raise ValueError("--neg_type only applies to --type dynamic")
 
@@ -869,6 +877,13 @@ if __name__ == "__main__":
     parser.add_argument("--eval_interval", type=int, default=1)
     parser.add_argument("--print_interval", type=int, default=500)
     parser.add_argument("--absolute", action="store_true")
+    parser.add_argument("--restore_head_top", action="store_true",
+                        help="3dhp only: slot 0 stores the camera-frame "
+                             "trajectory instead of head_top "
+                             "(data/prepare_data_mpi_inf_3dhp.py:489). Zero it "
+                             "at load time to get the real 17-joint body pose. "
+                             "Changes the meaning of MPJPE/PCK/AUC, so results "
+                             "are not comparable across this flag")
     parser.add_argument("--type", type=str, default="baseline")
     parser.add_argument("--no_logging", action="store_true")
     parser.add_argument("--checkpoint", type=str, default=None)
