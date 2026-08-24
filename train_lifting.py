@@ -16,7 +16,8 @@ from models.loss_net import LinearLossNet, MarginBasedLoss, NCELoss
 from models.sem_gcn import SemGCN, adj_mx_from_skeleton
 from models.video_pose import TemporalModelOptimized1f
 from utils.camera import normalize_screen_coordinates
-from utils.data_utils import create_2d_data, fetch_h36m, read_3d_data, read_3d_data_3dhp
+from utils.data_utils import (create_2d_data, drop_extreme_2d, fetch_h36m,
+                             read_3d_data, read_3d_data_3dhp)
 from utils.device import get_device
 from utils.h36m_dataset import Human36mDataset
 
@@ -195,6 +196,20 @@ def prepare_data_3dhp(args, data_path):
     poses_valid, poses_valid_2d, actions_valid, cams_valid = fetch_h36m(
         subjects_test, dataset, keypoints, action_filter, stride
     )
+    if args.max_2d_abs > 0:
+        (
+            poses_train,
+            poses_train_2d,
+            actions_train,
+            cams_train,
+            dropped,
+        ) = drop_extreme_2d(
+            poses_train, poses_train_2d, actions_train, cams_train, args.max_2d_abs
+        )
+        print(
+            f"==> Dropped {dropped} training frames with max|2d| > {args.max_2d_abs} "
+            f"(invalid projections; evaluation split untouched)"
+        )
     train_loader = DataLoader(
         PoseDataSet(poses_train, poses_train_2d, actions_train, cams_train),
         batch_size=args.batch_size,
@@ -896,6 +911,16 @@ if __name__ == "__main__":
     parser.add_argument("--task_linear_size", type=int, default=1024)
     parser.add_argument("--task_batch_norm", type=int, default=1)
     parser.add_argument("--keypoints", type=str, default="gt")
+    parser.add_argument("--max_2d_abs", type=float, default=10.0,
+                        help="3dhp only: drop TRAINING frames whose 2D "
+                             "annotation exceeds this magnitude. 3DHP's 2D "
+                             "is the mocap 3D projected per camera, so a "
+                             "diverging trajectory writes the perspective "
+                             "divide to file unchecked (308 frames, up to "
+                             "23364, on a screen normalised to [-1, 1]). "
+                             "They poison BatchNorm running stats and spike "
+                             "valid MPJPE. Set <= 0 to keep them and "
+                             "reproduce runs made before this flag")
     parser.add_argument("--loss_net", type=str, default="linear")
     parser.add_argument("--loss_dropout", type=float, default=0.5)
     parser.add_argument("--loss_num_stage", type=int, default=2)

@@ -117,3 +117,45 @@ def fetch_h36m(subjects, dataset, keypoints, action_filter=None, stride=1, parse
                 out_poses_3d[i] = out_poses_3d[i][::stride]
 
     return out_poses_3d, out_poses_2d, out_actions, out_cam
+
+def drop_extreme_2d(poses_3d, poses_2d, actions, cams, max_abs):
+    """Drop frames whose 2D annotation is a projection blow-up, not an observation.
+
+    3DHP's 2D keypoints are the mocap 3D projected into each camera, so when the
+    global trajectory diverges the perspective divide X/Z is written to file
+    unchecked. 308 training frames come out that way: the trajectory drifts
+    through the principal plane over 12 contiguous bursts (absolute depth median
+    0.42 m against a normal 3.39 m, minimum -0.02 m) and max|2d| reaches 23364
+    where the screen itself is normalised to [-1, 1]. No camera can observe a
+    point at Z = 0, so these frames are invalid annotations rather than hard
+    examples.
+
+    The local pose survives -- bone lengths stay within 0.975-1.044 of normal --
+    so only the 2D input is affected, and with --restore_head_top the 3D target
+    is clean too. But the input still poisons BatchNorm: train-mode BN folds the
+    outlier into the batch statistics, which momentum then writes into
+    running_mean/var. Those decay over ~10 batches, so an outlier landing near
+    the end of an epoch reaches eval intact and valid MPJPE jumps 3-9x.
+
+    Filter the training split only. The evaluation split has to stay fixed for
+    MPJPE to remain comparable across runs, and at the default threshold it
+    contains nothing to drop anyway (TS1-TS4 peak at 5.18).
+    """
+    kept_3d = None if poses_3d is None else []
+    kept_2d, kept_actions, kept_cams = [], [], []
+    dropped = 0
+
+    for i, seq_2d in enumerate(poses_2d):
+        seq_2d = np.asarray(seq_2d)
+        keep = np.abs(seq_2d).reshape(len(seq_2d), -1).max(1) <= max_abs
+        dropped += int((~keep).sum())
+        if not keep.any():
+            continue
+        kept_2d.append(seq_2d[keep])
+        kept_actions.append([a for a, k in zip(actions[i], keep) if k])
+        if kept_3d is not None:
+            kept_3d.append(np.asarray(poses_3d[i])[keep])
+        if cams:
+            kept_cams.append([c for c, k in zip(cams[i], keep) if k])
+
+    return kept_3d, kept_2d, kept_actions, kept_cams, dropped
