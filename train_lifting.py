@@ -11,6 +11,7 @@ from data.prepare_data_h3wb import Human3WBDataset, Human3WBTestDataset
 from data.prepare_data_mpi_inf_3dhp import MpiInf3dhpDataset
 from data_loader import PoseBuffer, PoseDataSet
 from eval import evaluate
+from models.energy_net import EnergyPrior
 from models.linear_model import LinearModel
 from models.loss_net import LinearLossNet, MarginBasedLoss, NCELoss
 from models.sem_gcn import SemGCN, adj_mx_from_skeleton
@@ -384,7 +385,7 @@ def main(args):
     else:
         optimizer = torch.optim.Adam(model_pos.parameters(), lr=args.lr)
 
-    if args.type != "baseline":
+    if args.type not in ("baseline", "dsm-prior"):
         model_loss = LinearLossNet(
             linear_size=args.loss_linear_size,
             num_stage=args.loss_num_stage,
@@ -460,6 +461,30 @@ def main(args):
                 except:
                     model_loss = checkpoint
 
+    energy_prior = None
+    if args.type == "dsm-prior":
+        if args.energy_checkpoint is None:
+            raise ValueError("--type dsm-prior requires --energy_checkpoint "
+                             "(pretrain one with train_energy_dsm.py)")
+        energy_prior = EnergyPrior.load(args.energy_checkpoint, map_location=device)
+        skeleton_parents = [int(p) for p in dataset.skeleton().parents()]
+        if energy_prior.bones.parents != skeleton_parents:
+            raise ValueError(
+                f"energy checkpoint skeleton {energy_prior.bones.parents} does not "
+                f"match dataset skeleton {skeleton_parents}; was it pretrained "
+                f"with the same dataset and --restore_head_top?"
+            )
+        energy_prior.to(device)
+        energy_prior.freeze()
+        # Same line format as the loss-net so report/parse_logs.py keeps the
+        # params_loss column filled for these runs.
+        print(
+            f"==> Number of parameters (loss-net): {sum(p.numel() for p in energy_prior.parameters()):,}"
+        )
+        print(f"==> DSM energy prior: {args.energy_checkpoint} (frozen), "
+              f"pretrain epoch {energy_prior.meta.get('epoch')}, "
+              f"val DSM {energy_prior.meta.get('val_dsm')}")
+
     start_time = time.time()
 
     if args.save_path is not None:
@@ -508,7 +533,9 @@ def main(args):
     # generator off the global RNG, so building it unconditionally would shift
     # the stream for baseline runs, which never touch this loader, and they
     # would stop reproducing the numbers they were tuned against.
-    loss_iter = iter(train_loader_loss) if args.type != "baseline" else None
+    # dsm-prior never consumes it either, and skipping keeps that run's RNG
+    # stream identical to baseline's.
+    loss_iter = iter(train_loader_loss) if args.type in ("dynamic", "static") else None
 
     while True:
         # for epoch in range(1, epochs + 1):
@@ -627,6 +654,32 @@ def main(args):
                 optimizer.step()
 
                 # check nan - outputs_3d
+                if torch.isnan(outputs_3d).any():
+                    print(f"Epoch: {epoch}, Nan in outputs_3d")
+                    raise ValueError("Nan in outputs_3d")
+
+            elif args.type == "dsm-prior":
+                # Frozen pretrained prior: no energy-net update, no loss
+                # loader, no negatives -- the only extra term is E*(T(y_hat)),
+                # whose input gradient B^T grad_z E is the DSM-trained field.
+                outputs_3d = model_pos(inputs_2d)
+                loss_3d_pos = criterion(outputs_3d, targets_3d)
+                energy_hat = energy_prior(outputs_3d)
+                with torch.no_grad():
+                    energy_label = energy_prior(targets_3d)
+                e_diff = energy_hat.detach() - energy_label
+                epoch_e_diff.update(e_diff.mean().item(), batch_size)
+                e_diffs += e_diff.cpu().numpy().ravel().tolist()
+
+                loss_energy = energy_hat.mean() * args.energy_weight
+                epoch_loss_3d_pos.update(loss_3d_pos.item(), batch_size)
+                epoch_loss_energy.update(loss_energy.item(), batch_size)
+
+                loss_total = args.mse_weight * loss_3d_pos + loss_energy
+                optimizer.zero_grad()
+                loss_total.backward()
+                optimizer.step()
+
                 if torch.isnan(outputs_3d).any():
                     print(f"Epoch: {epoch}, Nan in outputs_3d")
                     raise ValueError("Nan in outputs_3d")
@@ -869,12 +922,14 @@ def main(args):
             {
                 "model": model_pos.state_dict(),
                 "loss_net": (
-                    model_loss.state_dict() if args.type != "baseline" else None
+                    model_loss.state_dict()
+                    if args.type not in ("baseline", "dsm-prior")
+                    else None
                 ),
             },
             args.save_path,
         )
-        if args.type != "baseline":
+        if args.type not in ("baseline", "dsm-prior"):
             torch.save(model_loss, os.path.join(save_dir, f"final_loss_net.pth"))
 
 
@@ -903,6 +958,9 @@ if __name__ == "__main__":
     parser.add_argument("--no_logging", action="store_true")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--checkpoint_loss", type=str, default=None)
+    parser.add_argument("--energy_checkpoint", type=str, default=None,
+                        help="pretrained DSM energy prior for --type dsm-prior "
+                             "(train_energy_dsm.py output); loaded frozen")
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="h3wb")
     parser.add_argument("--task_net", type=str, default="linear")
