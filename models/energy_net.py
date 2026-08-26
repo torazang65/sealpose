@@ -25,19 +25,26 @@ Two input representations, selected per checkpoint by `features`:
                absolute size, so quotienting scale out keeps the transferable
                part and drops the rest.
 
-For "invariant" the corruption stays in GEOMETRY space -- raw bone vectors in
-metres, b~ = b + sigma*eps -- and never in feature space. Bone vectors rather
-than joint positions because B is invertible, so the two are the same space up
-to a linear map, and the 48 bone coordinates carry no degenerate direction: a
-root-centred pose in R^51 pins its root at the origin, a constraint a
-translation-invariant energy cannot express, so noise there would be answered
-by nothing. Two reasons, the second the deeper one:
-cos in [-1, 1] means Gaussian noise leaves the feature domain, and, more
-fundamentally, the length and angle blocks are geometrically coupled through y,
-so independent per-block noise produces a feature vector that no real skeleton
-can realise. Perturbing the pose keeps every sample a valid configuration and
-lets both blocks move together, the way the geometry dictates. Invariance is
-then a structural constraint on the energy, not a property of the noise.
+For "invariant" the corruption stays in GEOMETRY space and never in feature
+space: y~ = y + sigma*eps over the non-root joints ("joint", the default), or
+b~ = b + sigma*eps over the bone vectors ("bone"). Both keep every corrupted
+sample a real configuration, and both are 48-dimensional -- the root is left
+out so no noise lands on a translation the energy cannot see.
+
+They are NOT interchangeable. B is invertible but not orthogonal, so isotropic
+noise in one space is anisotropic in the other: perturbing bone vectors
+uniformly makes joint displacement accumulate along the kinematic chain (root
+0 mm, wrist 2.26x the hips), while perturbing joints uniformly makes every
+joint equally wrong, which is what a lifting network's error actually looks
+like.
+
+Corrupting the features instead would be wrong for two reasons, the second the
+deeper one: cos in [-1, 1] means Gaussian noise leaves the feature domain, and,
+more fundamentally, the length and angle blocks are geometrically coupled
+through the pose, so independent per-block noise produces a feature vector no
+real skeleton can realise. Perturbing the geometry lets both blocks move
+together the way that coupling dictates. Invariance is then a structural
+constraint on the energy, not a property of the noise.
 """
 
 from collections import defaultdict
@@ -112,14 +119,31 @@ class BoneTransform(nn.Module):
 class InvariantFeatures(nn.Module):
     """Bone vectors -> similarity-invariant shape coordinates.
 
-    Emits, in order:
-        log(||b_i|| / s)      one per bone, s = geometric mean of the lengths
-        cos(b_i, b_j)         one per pair of bones sharing a joint
+    Emits the angle block always, and a length block chosen by `lengths`:
 
-    Scale is quotiented out by the geometric mean, which makes the length block
-    sum to zero exactly -- one linear dependency among the features, harmless
-    for an MLP but it does make J_T rank deficient, so anything inverting
-    J J^T needs a pseudo-inverse or a ridge.
+        "full"      log(||b_i|| / s), one per bone, s the geometric mean
+        "symmetry"  log(||b_left|| / ||b_right||), one per mirrored pair
+        "none"      no length features at all
+        cos(b_i, b_j)   one per pair of bones sharing a joint (always)
+
+    The length block is where subject identity hides. 3DHP's bones are rigid
+    within a subject -- per-bone length std is 2e-6 m across all of S1 -- so
+    the 16 log-lengths take only as many distinct values as there are
+    subjects. Seven training subjects means an effective sample size of seven
+    for a 15-dimensional distribution, however many million frames the loader
+    reports, and "full" duly memorises them: the smallest sigma rung's
+    validation loss climbs from the first epoch whatever that rung is set to.
+
+    "symmetry" keeps the part that is learnable from seven subjects, because
+    it is the same constraint in every one of them: left and right bones match.
+    That is also the only structural property the 2026-08-26 bone-vector run
+    ever improved (LSE), while absolute length never moved. The remaining
+    proportion dimensions -- torso against limb and so on -- genuinely differ
+    per person and seven samples cannot describe them.
+
+    "full" makes the length block sum to zero exactly, one linear dependency
+    among the features; J_T is rank deficient either way, so anything
+    inverting J J^T needs a pseudo-inverse rather than a small ridge.
 
     Adjacent pairs cover both bones meeting head to tail and siblings hanging
     off the same joint. This deliberately omits dihedrals, so the map is NOT
@@ -131,17 +155,36 @@ class InvariantFeatures(nn.Module):
     perturbation the features cannot see. Add signed dihedrals if it is large.
 
     Args:
-        parents: parent index per joint, -1 for the root.
-        eps:     floor on bone length, metres. A pose perturbed at the top of
-                 the sigma ladder can collapse a bone toward zero, where the
-                 log and the unit vector would both blow up.
+        parents:      parent index per joint, -1 for the root.
+        lengths:      "full" | "symmetry" | "none", see above.
+        joints_left,
+        joints_right: mirrored joint lists, required for "symmetry". A bone is
+                      named by its child joint, so these pair the bones too.
+        eps:          floor on bone length, metres. A pose perturbed at the top
+                      of the sigma ladder can collapse a bone toward zero,
+                      where the log and the unit vector would both blow up.
     """
 
-    def __init__(self, parents, eps=1e-3):
+    def __init__(self, parents, lengths="symmetry", joints_left=None,
+                 joints_right=None, eps=1e-3):
         super(InvariantFeatures, self).__init__()
         parents = [int(p) for p in parents]
         bones = [j for j, p in enumerate(parents) if p != -1]
         slot = {j: i for i, j in enumerate(bones)}
+
+        if lengths not in ("full", "symmetry", "none"):
+            raise ValueError(f"unknown lengths={lengths!r}")
+        self.lengths = lengths
+        left_slot, right_slot = [], []
+        if lengths == "symmetry":
+            if joints_left is None or joints_right is None:
+                raise ValueError('lengths="symmetry" needs joints_left/right')
+            for l, r in zip(joints_left, joints_right):
+                if int(l) in slot and int(r) in slot:
+                    left_slot.append(slot[int(l)])
+                    right_slot.append(slot[int(r)])
+        self.register_buffer("left", torch.as_tensor(left_slot, dtype=torch.long))
+        self.register_buffer("right", torch.as_tensor(right_slot, dtype=torch.long))
 
         incident = defaultdict(list)
         for j in bones:
@@ -156,6 +199,8 @@ class InvariantFeatures(nn.Module):
 
         self.num_bones = len(bones)
         self.num_pairs = len(pairs)
+        self.num_lengths = {"full": len(bones), "symmetry": len(left_slot),
+                            "none": 0}[lengths]
         self.eps = eps
         self.register_buffer("pair_i", torch.as_tensor([p[0] for p in pairs],
                                                        dtype=torch.long))
@@ -164,17 +209,22 @@ class InvariantFeatures(nn.Module):
 
     @property
     def dim(self):
-        return self.num_bones + self.num_pairs
+        return self.num_lengths + self.num_pairs
 
     def forward(self, b):
-        """(B, n_bones, 3) bone vectors -> (B, n_bones + n_pairs)."""
+        """(B, n_bones, 3) bone vectors -> (B, num_lengths + n_pairs)."""
         b = b.view(b.shape[0], -1, 3)
         length = b.norm(dim=-1).clamp_min(self.eps)              # (B, n_bones)
         log_length = length.log()
-        z_length = log_length - log_length.mean(dim=1, keepdim=True)
 
         u = b / length.unsqueeze(-1)
         z_angle = (u[:, self.pair_i] * u[:, self.pair_j]).sum(-1)  # (B, n_pairs)
+        if self.lengths == "none":
+            return z_angle
+        if self.lengths == "symmetry":
+            z_length = log_length[:, self.left] - log_length[:, self.right]
+        else:
+            z_length = log_length - log_length.mean(dim=1, keepdim=True)
         return torch.cat([z_length, z_angle], dim=1)
 
 
@@ -294,12 +344,20 @@ class EnergyPrior(nn.Module):
     """
 
     def __init__(self, parents, mean, std, hidden=512, depth=3, sigmas=None,
-                 sigma0=0.1, features=None):
+                 sigma0=0.1, features=None, lengths="symmetry",
+                 joints_left=None, joints_right=None, noise_space="joint"):
         super(EnergyPrior, self).__init__()
         self.bones = BoneTransform(parents)
+        self.noise_space = noise_space
+        self.register_buffer("free", torch.as_tensor(
+            [j for j in range(self.bones.num_joints) if j != self.bones.root],
+            dtype=torch.long))
         self.features = None
         if features == "invariant":
-            self.features = InvariantFeatures(parents)
+            self.features = InvariantFeatures(
+                parents, lengths=lengths, joints_left=joints_left,
+                joints_right=joints_right,
+            )
             in_dim = self.features.dim
         elif features in (None, "bone"):
             in_dim = self.bones.num_bones * 3
@@ -318,23 +376,35 @@ class EnergyPrior(nn.Module):
     def corrupt_space(self, y):
         """Pose -> the coordinates pretraining added its noise to.
 
-        Raw bone vectors in metres for "invariant", standardized bone vectors
-        for "bone". Gates and diagnostics work in this space so they probe the
-        field where it was actually trained.
+        Non-root joint positions or raw bone vectors (metres) for "invariant",
+        standardized bone vectors for "bone". Gates and diagnostics work in
+        this space so they probe the field where it was actually trained.
         """
-        b = self.bones(y).flatten(1)
-        return b if self.features is not None else self.standardize(b)
+        if self.features is None:
+            return self.standardize(self.bones(y).flatten(1))
+        if self.noise_space == "joint":
+            y = y.view(y.shape[0], -1, 3)
+            return (y - y[:, self.bones.root:self.bones.root + 1])[:, self.free].flatten(1)
+        return self.bones(y).flatten(1)
 
-    def decode(self, x):
-        """Inverse of corrupt_space, up to translation (root at the origin)."""
+    def _pose(self, x):
+        """Corruption-space point -> full (B, J, 3) pose, root at the origin."""
+        if self.noise_space == "joint" and self.features is not None:
+            y = x.new_zeros(x.shape[0], self.bones.num_joints, 3)
+            y[:, self.free] = x.view(x.shape[0], -1, 3)
+            return y
         b = x if self.features is not None else self.standardize.inverse(x)
         return self.bones.compose(b.view(x.shape[0], -1, 3))
 
+    def decode(self, x):
+        """Inverse of corrupt_space, up to translation (root at the origin)."""
+        return self._pose(x)
+
     def energy_at(self, x):
         """Energy of a point given in the corruption space."""
-        if self.features is not None:
-            return self.net(self.standardize(self.features(x.view(x.shape[0], -1, 3))))
-        return self.net(x)
+        if self.features is None:
+            return self.net(x)
+        return self.net(self.standardize(self.features(self.bones(self._pose(x)))))
 
     def forward(self, y):
         return self.energy_at(self.corrupt_space(y))
@@ -364,6 +434,10 @@ class EnergyPrior(nn.Module):
             # Absent in checkpoints written before the invariant features
             # existed; those are all bone-vector priors.
             features=ckpt.get("features", "bone"),
+            lengths=ckpt.get("lengths", "full"),
+            joints_left=ckpt.get("joints_left"),
+            joints_right=ckpt.get("joints_right"),
+            noise_space=ckpt.get("noise_space", "bone"),
         )
         prior.net.load_state_dict(ckpt["net"])
         prior.meta = {k: ckpt[k] for k in ("train_args", "epoch", "val_dsm") if k in ckpt}
@@ -371,13 +445,18 @@ class EnergyPrior(nn.Module):
 
 
 def save_energy_checkpoint(path, net, parents, mean, std, sigmas, sigma0,
-                           features="bone", train_args=None, epoch=None,
-                           val_dsm=None):
+                           features="bone", lengths="full", joints_left=None,
+                           joints_right=None, noise_space="bone",
+                           train_args=None, epoch=None, val_dsm=None):
     """Single writer for the checkpoint format EnergyPrior.load expects."""
     torch.save(
         {
             "kind": "dsm_energy_prior",
             "features": features,
+            "lengths": lengths,
+            "noise_space": noise_space,
+            "joints_left": None if joints_left is None else [int(j) for j in joints_left],
+            "joints_right": None if joints_right is None else [int(j) for j in joints_right],
             "parents": [int(p) for p in parents],
             "hidden": net.hidden,
             "depth": net.depth,

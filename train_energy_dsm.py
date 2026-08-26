@@ -58,36 +58,30 @@ def load_split_poses(args, dataset, keypoints, subjects):
     return poses_3d
 
 
-def input_statistics(poses_3d, encode, dim, device, sigmas=None, seed=0,
-                     chunk=65536):
+def input_statistics(poses_3d, encode, dim, device, chunk=65536):
     """Per-coordinate mean/std of the energy net's input over the full split.
 
-    encode maps a batch of poses to that input, so the statistics always match
-    whatever representation the run selected.
+    `encode` maps a batch of poses to that input and may be stochastic. For the
+    invariant representation it MUST be the training-time chain -- corrupt in
+    the same space, with the same sigma ladder, then featurise -- because the
+    net only ever reads corrupted poses and the statistics have to describe
+    what it reads. Building it from the same callables the loop uses is what
+    keeps the two from drifting apart.
 
-    Pass `sigmas` to take the statistics over the NOISE-AUGMENTED distribution,
-    drawing one ladder rung per sample before encoding. That is what the net
-    actually reads during DSM, and for the invariant features it is the only
-    workable choice: some of them are structural constants of the skeleton --
-    the two hip bones leave the pelvis exactly anti-parallel, so their cosine
-    is -1.00000 with a spread of 5e-8 in clean data. Standardizing that against
-    its clean spread multiplies it by 1e4 and the loss is dominated by one
-    feature. Against the perturbed spread it gets a sane scale while keeping
-    the signal that matters: a bent pelvis is a strong off-manifold cue.
+    That matters more than it sounds: some invariant features are structural
+    constants of the skeleton -- the two hip bones leave the pelvis exactly
+    anti-parallel, so their cosine is -1.00000 with a spread of 5e-8 in clean
+    data. Standardising that against its clean spread multiplies one feature by
+    1e4 and the loss goes with it. Against the perturbed spread every feature
+    gets a sane scale and the off-manifold signal survives.
     """
     all_poses = np.concatenate(poses_3d).astype(np.float32)
     total = all_poses.shape[0]
     s = torch.zeros(dim, dtype=torch.float64, device=device)
     s2 = torch.zeros(dim, dtype=torch.float64, device=device)
-    generator = torch.Generator(device="cpu").manual_seed(seed)
     for start in range(0, total, chunk):
         y = torch.from_numpy(all_poses[start:start + chunk]).to(device)
         with torch.no_grad():
-            if sigmas is not None:
-                n = y.shape[0]
-                idx = torch.randint(sigmas.numel(), (n,), generator=generator)
-                sigma = sigmas[idx].to(device).view(n, 1, 1)
-                y = y + sigma * torch.randn(y.shape, generator=generator).to(device)
             z = encode(y).double()
         s += z.sum(dim=0)
         s2 += z.pow(2).sum(dim=0)
@@ -187,50 +181,86 @@ def main(args):
     # them, so sigma is a physical displacement and the length and angle blocks
     # move together the way the geometry couples them.
     if args.features == "invariant":
-        features = InvariantFeatures(parents).to(device)
+        skel = dataset.skeleton()
+        features = InvariantFeatures(
+            parents, lengths=args.lengths,
+            joints_left=skel.joints_left(), joints_right=skel.joints_right(),
+        ).to(device)
         in_dim = features.dim
-        stat_encode = lambda y: features(bones(y))
-        print(f"==> Invariant features: {features.num_bones} log-lengths + "
-              f"{features.num_pairs} adjacent cosines = {in_dim} "
-              f"(no dihedrals; {bones.num_bones * 3 - 4} shape DOF)")
+        print(f"==> Corruption space: {args.noise_space}")
+        print(f"==> Invariant features: {features.num_lengths} length "
+              f"({args.lengths}) + {features.num_pairs} adjacent cosines "
+              f"= {in_dim} (no dihedrals; {bones.num_bones * 3 - 4} shape DOF)")
     else:
         features = None
         in_dim = bones.num_bones * 3
-        stat_encode = lambda y: bones(y).flatten(1)
         print(f"==> Bone-vector features: {in_dim}")
 
     sigmas = torch.logspace(
         np.log10(args.sigma_min), np.log10(args.sigma_max), args.num_sigmas
     )
+    dsm = MultiScaleDSM(sigmas, args.sigma0).to(device)
+    skel = dataset.skeleton()
+    jl = skel.joints_left() if features is not None else None
+    jr = skel.joints_right() if features is not None else None
 
-    # "bone" standardizes first and corrupts the standardized coordinates, so
-    # its statistics are over clean data. "invariant" corrupts first and reads
-    # features of the corrupted pose, so its statistics must be too.
-    stat_sigmas = sigmas if features is not None else None
-    mean, std = input_statistics(poses_train, stat_encode, in_dim, device,
-                                 sigmas=stat_sigmas, seed=args.seed)
+    if features is not None:
+        if args.noise_space == "joint":
+            free = torch.as_tensor(
+                [j for j in range(bones.num_joints) if j != bones.root],
+                dtype=torch.long, device=device)
+
+            def corrupt_space(y):
+                y = y.view(y.shape[0], -1, 3)
+                return (y - y[:, bones.root:bones.root + 1])[:, free].flatten(1)
+
+            def to_pose(x):
+                y = x.new_zeros(x.shape[0], bones.num_joints, 3)
+                y[:, free] = x.view(x.shape[0], -1, 3)
+                return y
+        else:
+            corrupt_space = lambda y: bones(y).flatten(1)
+            to_pose = lambda x: bones.compose(x.view(x.shape[0], -1, 3))
+
+        def features_of(x):
+            return features(bones(to_pose(x)))
+
+        # Exactly the training corruption: same space, same ladder. Seeded so
+        # the statistics are reproducible without perturbing the global RNG.
+        stat_gen = torch.Generator(device="cpu").manual_seed(args.seed + 20000)
+
+        def stat_encode(y):
+            x = corrupt_space(y)
+            idx = torch.randint(sigmas.numel(), (x.shape[0],), generator=stat_gen)
+            sigma = sigmas[idx].to(device).unsqueeze(1)
+            eps = torch.randn(x.shape, generator=stat_gen).to(device)
+            return features_of(x + sigma * eps)
+    else:
+        # "bone" standardizes first and corrupts the standardized coordinates,
+        # so its statistics are over clean data by construction.
+        stat_encode = lambda y: bones(y).flatten(1)
+
+    mean, std = input_statistics(poses_train, stat_encode, in_dim, device)
     standardizer = Standardizer(mean, std).to(device)
-    label = "noise-augmented" if stat_sigmas is not None else "clean"
+    label = "training corruption" if features is not None else "clean"
     print(f"==> Input std ({label}): min {std.min():.4f}, "
           f"median {std.median():.4f}, max {std.max():.4f}")
     if features is not None:
-        clean_mean, clean_std = input_statistics(poses_train, stat_encode,
-                                                 in_dim, device)
+        _, clean_std = input_statistics(poses_train,
+                                        lambda y: features(bones(y)),
+                                        in_dim, device)
         print(f"==> Input std (clean, for reference): min {clean_std.min():.2e}, "
               f"median {clean_std.median():.4f}, max {clean_std.max():.4f}")
 
     net = EnergyNet(in_dim, hidden=args.hidden, depth=args.depth).to(device)
 
     if features is not None:
-        corrupt_space = lambda y: bones(y).flatten(1)
         def energy_fn(x):
-            return net(standardizer(features(x.view(x.shape[0], -1, 3))))
+            return net(standardizer(features_of(x)))
     else:
         corrupt_space = lambda y: standardizer(bones(y).flatten(1))
         def energy_fn(x):
             return net(x)
-
-    dsm = MultiScaleDSM(sigmas, args.sigma0).to(device)
     if features is not None:
         print(f"==> Sigma ladder (mm, per bone vector): "
               f"{[round(s * 1000, 1) for s in sigmas.tolist()]}, "
@@ -282,8 +312,10 @@ def main(args):
             early_stopping_counter = 0
             save_energy_checkpoint(
                 args.save_path, net, parents, mean, std, sigmas, args.sigma0,
-                features=args.features, train_args=vars(args), epoch=epoch,
-                val_dsm=val_loss,
+                features=args.features, lengths=args.lengths,
+                noise_space=args.noise_space,
+                joints_left=jl, joints_right=jr,
+                train_args=vars(args), epoch=epoch, val_dsm=val_loss,
             )
         else:
             early_stopping_counter += 1
@@ -305,8 +337,10 @@ def main(args):
         # retrain-on-full mode: no selection signal, the final epoch is the model
         save_energy_checkpoint(
             args.save_path, net, parents, mean, std, sigmas, args.sigma0,
-            features=args.features, train_args=vars(args), epoch=args.num_epoch,
-            val_dsm=None,
+            features=args.features, lengths=args.lengths,
+            noise_space=args.noise_space,
+            joints_left=jl, joints_right=jr,
+            train_args=vars(args), epoch=args.num_epoch, val_dsm=None,
         )
         print(f"Saved final epoch to {args.save_path} (no validation split)")
     else:
@@ -341,6 +375,22 @@ if __name__ == "__main__":
     parser.add_argument("--patience", type=int, default=10,
                         help="epochs without val improvement before stopping; "
                              "<1 disables early stopping")
+    parser.add_argument("--noise_space", type=str, default="joint",
+                        choices=["joint", "bone"],
+                        help="--features invariant only: where the Gaussian "
+                             "corruption is added. 'joint' displaces every "
+                             "non-root joint equally, which is what a lifting "
+                             "net's error looks like; 'bone' displaces every "
+                             "bone equally, which makes joint error accumulate "
+                             "along the chain (wrist 2.26x the hips)")
+    parser.add_argument("--lengths", type=str, default="symmetry",
+                        choices=["full", "symmetry", "none"],
+                        help="--features invariant only: which length "
+                             "information the energy sees. 3DHP bones are "
+                             "rigid per subject, so 'full' has an effective "
+                             "sample size of one vector per subject and "
+                             "memorises them; 'symmetry' keeps only the "
+                             "left-right ratios, which every subject shares")
     parser.add_argument("--features", type=str, default="invariant",
                         choices=["bone", "invariant"],
                         help="energy input: bone vectors (the 2026-08-26 "
