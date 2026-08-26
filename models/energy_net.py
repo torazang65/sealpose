@@ -1,20 +1,46 @@
-"""Unconditional DSM-trained energy prior over bone-vector coordinates.
+"""Unconditional DSM-trained energy prior over the body's shape coordinates.
 
 The SEAL energy net learned E(x, y) from a hinge on energy *values* at the
 finitely many (prediction, GT) pairs the run happened to visit, which leaves
 the gradient field -- the only thing the task net ever consumes -- entirely
-unconstrained (report/2026-08-19_seal_synthetic_negatives.md; the clean runs
-of 2026-08-25 confirmed E-diff grows while MPJPE stays at baseline). This
-module replaces that with an unconditional E(z) whose gradient field is the
+unconstrained (report/2026-08-19_seal_synthetic_negatives.md). This module
+replaces that with an unconditional energy whose gradient field is the
 regression target itself: multi-scale denoising score matching (MDSM, Li et
-al. 2019) over bone vectors z = By.
+al. 2019).
 
-Bone vectors rather than joint positions because the body prior is nearly
-axis-aligned there -- "femur length is constant" is a constraint on one
-3-vector's norm instead of a curved constraint tying six joint coordinates --
-and because B is linear and invertible, so p_z and p_y differ by a constant
-|det B| and Gaussian DSM in z-space is exact, no manifold corrections needed.
+Two input representations, selected per checkpoint by `features`:
+
+  "bone"       z = By, the raw per-bone offset vectors. B is linear and
+               invertible, so p_z and p_y differ by the constant |det B| and
+               Gaussian DSM in z-space is exact. This is the representation
+               of the 2026-08-26 report.
+
+  "invariant"  (log bone length / geometric mean, cosines of adjacent bone
+               pairs) -- invariant to translation, global rotation AND global
+               scale. Motivated by that report: the bone-vector prior spent
+               capacity on absolute stature and camera orientation, neither of
+               which transfers to a new subject, and its structural gains were
+               confined to left-right symmetry (the one property every skeleton
+               shares). Proportions are far more universal across people than
+               absolute size, so quotienting scale out keeps the transferable
+               part and drops the rest.
+
+For "invariant" the corruption stays in GEOMETRY space -- raw bone vectors in
+metres, b~ = b + sigma*eps -- and never in feature space. Bone vectors rather
+than joint positions because B is invertible, so the two are the same space up
+to a linear map, and the 48 bone coordinates carry no degenerate direction: a
+root-centred pose in R^51 pins its root at the origin, a constraint a
+translation-invariant energy cannot express, so noise there would be answered
+by nothing. Two reasons, the second the deeper one:
+cos in [-1, 1] means Gaussian noise leaves the feature domain, and, more
+fundamentally, the length and angle blocks are geometrically coupled through y,
+so independent per-block noise produces a feature vector that no real skeleton
+can realise. Perturbing the pose keeps every sample a valid configuration and
+lets both blocks move together, the way the geometry dictates. Invariance is
+then a structural constraint on the energy, not a property of the noise.
 """
+
+from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -40,6 +66,7 @@ class BoneTransform(nn.Module):
         if parents.count(-1) != 1:
             raise ValueError(f"expected exactly one root, got parents={parents}")
         self.parents = parents
+        self.root = parents.index(-1)
         self.num_joints = len(parents)
         bones = [j for j, p in enumerate(parents) if p != -1]
         index = {j: i for i, j in enumerate(bones)}
@@ -47,7 +74,7 @@ class BoneTransform(nn.Module):
         # Forward-kinematics order for compose(): place a bone only once its
         # parent joint has been placed (same construction as
         # utils.loss.BoneDirectionPerturber).
-        placed = {parents.index(-1)}
+        placed = {self.root}
         order = []
         while len(order) < len(bones):
             progressed = False
@@ -82,13 +109,83 @@ class BoneTransform(nn.Module):
         return out
 
 
+class InvariantFeatures(nn.Module):
+    """Bone vectors -> similarity-invariant shape coordinates.
+
+    Emits, in order:
+        log(||b_i|| / s)      one per bone, s = geometric mean of the lengths
+        cos(b_i, b_j)         one per pair of bones sharing a joint
+
+    Scale is quotiented out by the geometric mean, which makes the length block
+    sum to zero exactly -- one linear dependency among the features, harmless
+    for an MLP but it does make J_T rank deficient, so anything inverting
+    J J^T needs a pseudo-inverse or a ridge.
+
+    Adjacent pairs cover both bones meeting head to tail and siblings hanging
+    off the same joint. This deliberately omits dihedrals, so the map is NOT
+    complete: bone lengths plus adjacent angles leave the torsion about each
+    bone free, and cosines are invariant to reflection, so chirality is lost
+    too. On the 3DHP skeleton it emits 16 + 19 = 35 numbers for 44 shape
+    degrees of freedom (48 bone coordinates less 3 rotation and 1 scale), and
+    report/check_energy_prior.py measures what that costs as the fraction of a
+    perturbation the features cannot see. Add signed dihedrals if it is large.
+
+    Args:
+        parents: parent index per joint, -1 for the root.
+        eps:     floor on bone length, metres. A pose perturbed at the top of
+                 the sigma ladder can collapse a bone toward zero, where the
+                 log and the unit vector would both blow up.
+    """
+
+    def __init__(self, parents, eps=1e-3):
+        super(InvariantFeatures, self).__init__()
+        parents = [int(p) for p in parents]
+        bones = [j for j, p in enumerate(parents) if p != -1]
+        slot = {j: i for i, j in enumerate(bones)}
+
+        incident = defaultdict(list)
+        for j in bones:
+            incident[j].append(slot[j])              # bone j ends at joint j
+            incident[parents[j]].append(slot[j])     # and starts at its parent
+        pairs = set()
+        for bs in incident.values():
+            for a in range(len(bs)):
+                for b in range(a + 1, len(bs)):
+                    pairs.add((min(bs[a], bs[b]), max(bs[a], bs[b])))
+        pairs = sorted(pairs)
+
+        self.num_bones = len(bones)
+        self.num_pairs = len(pairs)
+        self.eps = eps
+        self.register_buffer("pair_i", torch.as_tensor([p[0] for p in pairs],
+                                                       dtype=torch.long))
+        self.register_buffer("pair_j", torch.as_tensor([p[1] for p in pairs],
+                                                       dtype=torch.long))
+
+    @property
+    def dim(self):
+        return self.num_bones + self.num_pairs
+
+    def forward(self, b):
+        """(B, n_bones, 3) bone vectors -> (B, n_bones + n_pairs)."""
+        b = b.view(b.shape[0], -1, 3)
+        length = b.norm(dim=-1).clamp_min(self.eps)              # (B, n_bones)
+        log_length = length.log()
+        z_length = log_length - log_length.mean(dim=1, keepdim=True)
+
+        u = b / length.unsqueeze(-1)
+        z_angle = (u[:, self.pair_i] * u[:, self.pair_j]).sum(-1)  # (B, n_pairs)
+        return torch.cat([z_length, z_angle], dim=1)
+
+
 class Standardizer(nn.Module):
     """Per-coordinate z-scoring with train-set statistics.
 
-    Mandatory before DSM: bone-length axes have tiny variance (lengths are
-    near-constant within a subject), so without this the score along those
-    axes scales like 1/variance and dominates the landscape. After z-scoring a
-    single sigma ladder applies uniformly to every coordinate.
+    Mandatory before DSM: the coordinates have wildly different spreads --
+    bone-length axes are near-constant within a subject, and in the invariant
+    representation log-proportions vary far less than cosines -- so without
+    this the score along the tight axes scales like 1/variance and dominates
+    the landscape.
     """
 
     def __init__(self, mean, std):
@@ -106,11 +203,11 @@ class Standardizer(nn.Module):
 
 
 class EnergyNet(nn.Module):
-    """Scalar energy over standardized bone vectors.
+    """Scalar energy over standardized coordinates.
 
     Plain MLP, but with two hard requirements DSM adds over LinearLossNet:
     no dropout (a stochastic gradient field cannot be regressed) and a smooth
-    activation (a piecewise-linear net has a piecewise-constant gradient in z,
+    activation (a piecewise-linear net has a piecewise-constant gradient,
     which cannot follow the continuous regression target). No batch norm for
     the same reason train/eval gradient fields must coincide.
     """
@@ -134,13 +231,20 @@ class EnergyNet(nn.Module):
 
 
 class MultiScaleDSM(nn.Module):
-    """MDSM loss: sum_sigma l(sigma) E ||z - z~ + sigma_0^2 grad E(z~)||^2.
+    """MDSM loss: sum_sigma l(sigma) E ||x - x~ + sigma_0^2 grad E(x~)||^2.
+
+    Generic in the corrupted variable: pass whatever space the noise lives in
+    as `x` and a callable mapping it to a scalar energy. For features="bone"
+    that is standardized bone vectors and the callable is the net itself; for
+    features="invariant" it is the root-centred pose in metres and the
+    callable runs bones -> features -> standardize -> net.
 
     One sigma per sample, drawn uniformly from the ladder, so every batch
     mixes scales. l(sigma) = 1/sigma^2: the residual magnitude grows like
     sigma, so the unweighted sum would be dominated by the largest scales and
     the near-manifold field -- the part the task net lives in -- would never
-    train. sigma_0 is a single fixed anchor (the energy stays unconditional).
+    train. sigma_0 is a single fixed anchor (the energy stays unconditional);
+    it only rescales E, and energy_weight is recalibrated against it anyway.
 
     Pass a CPU torch.Generator to make the noise deterministic -- the
     validation loss must not jitter between evals or patience-based early
@@ -152,42 +256,58 @@ class MultiScaleDSM(nn.Module):
         self.register_buffer("sigmas", torch.as_tensor(sigmas, dtype=torch.float32))
         self.sigma0 = float(sigma0)
 
-    def forward(self, net, z_flat, generator=None, create_graph=True):
+    def forward(self, energy_fn, x, generator=None, create_graph=True):
         """Returns (loss, sigma_idx, per_sample_loss); the last two detached."""
-        batch, dim = z_flat.shape
+        batch, dim = x.shape
         num_sigmas = self.sigmas.numel()
         if generator is not None:
-            idx = torch.randint(num_sigmas, (batch,), generator=generator).to(z_flat.device)
-            eps = torch.randn((batch, dim), generator=generator).to(z_flat.device)
+            idx = torch.randint(num_sigmas, (batch,), generator=generator).to(x.device)
+            eps = torch.randn((batch, dim), generator=generator).to(x.device)
         else:
-            idx = torch.randint(num_sigmas, (batch,), device=z_flat.device)
-            eps = torch.randn_like(z_flat)
+            idx = torch.randint(num_sigmas, (batch,), device=x.device)
+            eps = torch.randn_like(x)
         sigma = self.sigmas[idx].unsqueeze(1)
 
-        z_tilde = (z_flat + sigma * eps).detach().requires_grad_(True)
-        energy = net(z_tilde)
-        grad = torch.autograd.grad(energy.sum(), z_tilde, create_graph=create_graph)[0]
+        x_tilde = (x + sigma * eps).detach().requires_grad_(True)
+        energy = energy_fn(x_tilde)
+        grad = torch.autograd.grad(energy.sum(), x_tilde, create_graph=create_graph)[0]
 
-        resid = z_flat.detach() - z_tilde + (self.sigma0 ** 2) * grad
+        resid = x.detach() - x_tilde + (self.sigma0 ** 2) * grad
         per_sample = resid.pow(2).sum(dim=1) / sigma.squeeze(1).pow(2)
         return per_sample.mean(), idx.detach(), per_sample.detach()
 
 
 class EnergyPrior(nn.Module):
-    """Frozen pretrained prior for task training (train_lifting --type dsm-prior).
+    """Pretrained prior, frozen for task training (train_lifting --type dsm-prior).
 
-    forward(y) chains bones -> standardize -> E, so the task net's gradient is
-    B^T J_std^T grad_z E: each bone's gradient lands on its two endpoint
-    joints with opposite signs, spring-force style. The wrapper carries the
-    train-time standardizer statistics so task training cannot drift from the
-    pretraining coordinates.
+    forward(y) chains bones -> [features] -> standardize -> E, so the task
+    net's gradient is J^T grad E: each bone's gradient lands on its two
+    endpoint joints with opposite signs, spring-force style. The wrapper
+    carries the train-time standardizer statistics so task training cannot
+    drift from the pretraining coordinates.
+
+    With features="invariant" the energy is invariant to global scale and
+    rotation, so by Euler's theorem its gradient never rescales the pose and
+    exerts no net torque -- it can only change shape. Those are exactly the
+    directions the 2026-08-26 sweep found useless, so removing them should
+    raise the useful fraction of an already mostly-tangential force.
     """
 
-    def __init__(self, parents, mean, std, hidden=512, depth=3, sigmas=None, sigma0=0.1):
+    def __init__(self, parents, mean, std, hidden=512, depth=3, sigmas=None,
+                 sigma0=0.1, features=None):
         super(EnergyPrior, self).__init__()
         self.bones = BoneTransform(parents)
+        self.features = None
+        if features == "invariant":
+            self.features = InvariantFeatures(parents)
+            in_dim = self.features.dim
+        elif features in (None, "bone"):
+            in_dim = self.bones.num_bones * 3
+        else:
+            raise ValueError(f"unknown features={features!r}")
+        self.feature_mode = features or "bone"
         self.standardize = Standardizer(mean, std)
-        self.net = EnergyNet(self.bones.num_bones * 3, hidden=hidden, depth=depth)
+        self.net = EnergyNet(in_dim, hidden=hidden, depth=depth)
         self.register_buffer(
             "sigmas",
             torch.as_tensor(sigmas if sigmas is not None else [], dtype=torch.float32),
@@ -195,9 +315,29 @@ class EnergyPrior(nn.Module):
         self.sigma0 = float(sigma0)
         self.meta = {}
 
+    def corrupt_space(self, y):
+        """Pose -> the coordinates pretraining added its noise to.
+
+        Raw bone vectors in metres for "invariant", standardized bone vectors
+        for "bone". Gates and diagnostics work in this space so they probe the
+        field where it was actually trained.
+        """
+        b = self.bones(y).flatten(1)
+        return b if self.features is not None else self.standardize(b)
+
+    def decode(self, x):
+        """Inverse of corrupt_space, up to translation (root at the origin)."""
+        b = x if self.features is not None else self.standardize.inverse(x)
+        return self.bones.compose(b.view(x.shape[0], -1, 3))
+
+    def energy_at(self, x):
+        """Energy of a point given in the corruption space."""
+        if self.features is not None:
+            return self.net(self.standardize(self.features(x.view(x.shape[0], -1, 3))))
+        return self.net(x)
+
     def forward(self, y):
-        z = self.bones(y).flatten(1)
-        return self.net(self.standardize(z))
+        return self.energy_at(self.corrupt_space(y))
 
     def freeze(self):
         self.eval()
@@ -221,6 +361,9 @@ class EnergyPrior(nn.Module):
             depth=ckpt["depth"],
             sigmas=ckpt["sigmas"],
             sigma0=ckpt["sigma0"],
+            # Absent in checkpoints written before the invariant features
+            # existed; those are all bone-vector priors.
+            features=ckpt.get("features", "bone"),
         )
         prior.net.load_state_dict(ckpt["net"])
         prior.meta = {k: ckpt[k] for k in ("train_args", "epoch", "val_dsm") if k in ckpt}
@@ -228,11 +371,13 @@ class EnergyPrior(nn.Module):
 
 
 def save_energy_checkpoint(path, net, parents, mean, std, sigmas, sigma0,
-                           train_args=None, epoch=None, val_dsm=None):
+                           features="bone", train_args=None, epoch=None,
+                           val_dsm=None):
     """Single writer for the checkpoint format EnergyPrior.load expects."""
     torch.save(
         {
             "kind": "dsm_energy_prior",
+            "features": features,
             "parents": [int(p) for p in parents],
             "hidden": net.hidden,
             "depth": net.depth,

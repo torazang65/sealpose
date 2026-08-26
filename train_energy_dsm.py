@@ -28,8 +28,9 @@ from torch.utils.data import DataLoader
 
 from data.prepare_data_mpi_inf_3dhp import MpiInf3dhpDataset
 from data_loader import PoseTarget3D
-from models.energy_net import (BoneTransform, EnergyNet, MultiScaleDSM,
-                               Standardizer, save_energy_checkpoint)
+from models.energy_net import (BoneTransform, EnergyNet, InvariantFeatures,
+                               MultiScaleDSM, Standardizer,
+                               save_energy_checkpoint)
 from utils.data_utils import (create_2d_data, drop_extreme_2d, fetch_h36m,
                               read_3d_data_3dhp)
 from utils.device import get_device
@@ -57,16 +58,37 @@ def load_split_poses(args, dataset, keypoints, subjects):
     return poses_3d
 
 
-def bone_statistics(poses_3d, bones, device, chunk=65536):
-    """Per-coordinate mean/std of flattened bone vectors over the full split."""
+def input_statistics(poses_3d, encode, dim, device, sigmas=None, seed=0,
+                     chunk=65536):
+    """Per-coordinate mean/std of the energy net's input over the full split.
+
+    encode maps a batch of poses to that input, so the statistics always match
+    whatever representation the run selected.
+
+    Pass `sigmas` to take the statistics over the NOISE-AUGMENTED distribution,
+    drawing one ladder rung per sample before encoding. That is what the net
+    actually reads during DSM, and for the invariant features it is the only
+    workable choice: some of them are structural constants of the skeleton --
+    the two hip bones leave the pelvis exactly anti-parallel, so their cosine
+    is -1.00000 with a spread of 5e-8 in clean data. Standardizing that against
+    its clean spread multiplies it by 1e4 and the loss is dominated by one
+    feature. Against the perturbed spread it gets a sane scale while keeping
+    the signal that matters: a bent pelvis is a strong off-manifold cue.
+    """
     all_poses = np.concatenate(poses_3d).astype(np.float32)
     total = all_poses.shape[0]
-    dim = bones.num_bones * 3
     s = torch.zeros(dim, dtype=torch.float64, device=device)
     s2 = torch.zeros(dim, dtype=torch.float64, device=device)
+    generator = torch.Generator(device="cpu").manual_seed(seed)
     for start in range(0, total, chunk):
         y = torch.from_numpy(all_poses[start:start + chunk]).to(device)
-        z = bones(y).flatten(1).double()
+        with torch.no_grad():
+            if sigmas is not None:
+                n = y.shape[0]
+                idx = torch.randint(sigmas.numel(), (n,), generator=generator)
+                sigma = sigmas[idx].to(device).view(n, 1, 1)
+                y = y + sigma * torch.randn(y.shape, generator=generator).to(device)
+            z = encode(y).double()
         s += z.sum(dim=0)
         s2 += z.pow(2).sum(dim=0)
     mean = s / total
@@ -74,9 +96,13 @@ def bone_statistics(poses_3d, bones, device, chunk=65536):
     return mean.float().cpu(), var.sqrt().float().cpu()
 
 
-def run_epoch(loader, bones, standardizer, net, dsm, optimizer=None,
+def run_epoch(loader, corrupt_space, energy_fn, net, dsm, optimizer=None,
               generator=None, grad_clip=0.0, limit_batches=0, device="cpu"):
-    """One pass; optimizer=None means evaluation (fresh generator => same noise)."""
+    """One pass; optimizer=None means evaluation (fresh generator => same noise).
+
+    corrupt_space maps a pose batch to the coordinates the noise is added to,
+    and energy_fn scores a (possibly corrupted) point in that same space.
+    """
     meter = AverageMeter()
     num_sigmas = dsm.sigmas.numel()
     per_sigma_sum = torch.zeros(num_sigmas)
@@ -85,8 +111,8 @@ def run_epoch(loader, bones, standardizer, net, dsm, optimizer=None,
     net.train(training)
     for i, y in enumerate(loader):
         y = y.to(device)
-        z = standardizer(bones(y).flatten(1))
-        loss, idx, per_sample = dsm(net, z, generator=generator,
+        x = corrupt_space(y)
+        loss, idx, per_sample = dsm(energy_fn, x, generator=generator,
                                     create_graph=training)
         if training:
             optimizer.zero_grad()
@@ -152,24 +178,70 @@ def main(args):
     parents = list(dataset.skeleton().parents())
     bones = BoneTransform(parents).to(device)
     print(f"==> Joints: {len(parents)}, bones: {bones.num_bones}, "
-          f"root: joint {parents.index(-1)}")
+          f"root: joint {bones.root}")
 
-    mean, std = bone_statistics(poses_train, bones, device)
-    standardizer = Standardizer(mean, std).to(device)
-    print(f"==> Bone-vector std (m): min {std.min():.4f}, "
-          f"median {std.median():.4f}, max {std.max():.4f}")
+    # Two representations, and they differ in what gets corrupted as well as in
+    # what the net reads. "bone" corrupts the standardized bone vectors it also
+    # scores, so sigma is in standardized units. "invariant" corrupts the raw
+    # bone vectors in metres and scores the invariant features computed from
+    # them, so sigma is a physical displacement and the length and angle blocks
+    # move together the way the geometry couples them.
+    if args.features == "invariant":
+        features = InvariantFeatures(parents).to(device)
+        in_dim = features.dim
+        stat_encode = lambda y: features(bones(y))
+        print(f"==> Invariant features: {features.num_bones} log-lengths + "
+              f"{features.num_pairs} adjacent cosines = {in_dim} "
+              f"(no dihedrals; {bones.num_bones * 3 - 4} shape DOF)")
+    else:
+        features = None
+        in_dim = bones.num_bones * 3
+        stat_encode = lambda y: bones(y).flatten(1)
+        print(f"==> Bone-vector features: {in_dim}")
 
     sigmas = torch.logspace(
         np.log10(args.sigma_min), np.log10(args.sigma_max), args.num_sigmas
     )
-    dsm = MultiScaleDSM(sigmas, args.sigma0).to(device)
-    print(f"==> Sigma ladder (standardized): "
-          f"{[round(s, 4) for s in sigmas.tolist()]}")
-    print(f"==> Sigma ladder (~mm at median std): "
-          f"{[round(s * std.median().item() * 1000, 1) for s in sigmas.tolist()]}, "
-          f"sigma0 {args.sigma0}")
 
-    net = EnergyNet(bones.num_bones * 3, hidden=args.hidden, depth=args.depth).to(device)
+    # "bone" standardizes first and corrupts the standardized coordinates, so
+    # its statistics are over clean data. "invariant" corrupts first and reads
+    # features of the corrupted pose, so its statistics must be too.
+    stat_sigmas = sigmas if features is not None else None
+    mean, std = input_statistics(poses_train, stat_encode, in_dim, device,
+                                 sigmas=stat_sigmas, seed=args.seed)
+    standardizer = Standardizer(mean, std).to(device)
+    label = "noise-augmented" if stat_sigmas is not None else "clean"
+    print(f"==> Input std ({label}): min {std.min():.4f}, "
+          f"median {std.median():.4f}, max {std.max():.4f}")
+    if features is not None:
+        clean_mean, clean_std = input_statistics(poses_train, stat_encode,
+                                                 in_dim, device)
+        print(f"==> Input std (clean, for reference): min {clean_std.min():.2e}, "
+              f"median {clean_std.median():.4f}, max {clean_std.max():.4f}")
+
+    net = EnergyNet(in_dim, hidden=args.hidden, depth=args.depth).to(device)
+
+    if features is not None:
+        corrupt_space = lambda y: bones(y).flatten(1)
+        def energy_fn(x):
+            return net(standardizer(features(x.view(x.shape[0], -1, 3))))
+    else:
+        corrupt_space = lambda y: standardizer(bones(y).flatten(1))
+        def energy_fn(x):
+            return net(x)
+
+    dsm = MultiScaleDSM(sigmas, args.sigma0).to(device)
+    if features is not None:
+        print(f"==> Sigma ladder (mm, per bone vector): "
+              f"{[round(s * 1000, 1) for s in sigmas.tolist()]}, "
+              f"sigma0 {args.sigma0}")
+    else:
+        print(f"==> Sigma ladder (standardized): "
+              f"{[round(s, 4) for s in sigmas.tolist()]}")
+        print(f"==> Sigma ladder (~mm at median std): "
+              f"{[round(s * std.median().item() * 1000, 1) for s in sigmas.tolist()]}, "
+              f"sigma0 {args.sigma0}")
+
     print(f"==> Number of parameters (energy net): "
           f"{sum(p.numel() for p in net.parameters()):,}")
     if args.weight_decay > 0:
@@ -186,7 +258,7 @@ def main(args):
     start_time = time.time()
     for epoch in range(1, args.num_epoch + 1):
         train_loss, train_per_sigma = run_epoch(
-            train_loader, bones, standardizer, net, dsm,
+            train_loader, corrupt_space, energy_fn, net, dsm,
             optimizer=optimizer, grad_clip=args.grad_clip,
             limit_batches=args.limit_train_batches, device=device,
         )
@@ -196,7 +268,7 @@ def main(args):
             # so patience reacts to the model, not to the noise draw.
             generator = torch.Generator().manual_seed(args.seed + 10000)
             val_loss, val_per_sigma = run_epoch(
-                val_loader, bones, standardizer, net, dsm,
+                val_loader, corrupt_space, energy_fn, net, dsm,
                 optimizer=None, generator=generator,
                 limit_batches=args.limit_val_batches, device=device,
             )
@@ -210,7 +282,8 @@ def main(args):
             early_stopping_counter = 0
             save_energy_checkpoint(
                 args.save_path, net, parents, mean, std, sigmas, args.sigma0,
-                train_args=vars(args), epoch=epoch, val_dsm=val_loss,
+                features=args.features, train_args=vars(args), epoch=epoch,
+                val_dsm=val_loss,
             )
         else:
             early_stopping_counter += 1
@@ -232,7 +305,8 @@ def main(args):
         # retrain-on-full mode: no selection signal, the final epoch is the model
         save_energy_checkpoint(
             args.save_path, net, parents, mean, std, sigmas, args.sigma0,
-            train_args=vars(args), epoch=args.num_epoch, val_dsm=None,
+            features=args.features, train_args=vars(args), epoch=args.num_epoch,
+            val_dsm=None,
         )
         print(f"Saved final epoch to {args.save_path} (no validation split)")
     else:
@@ -267,13 +341,22 @@ if __name__ == "__main__":
     parser.add_argument("--patience", type=int, default=10,
                         help="epochs without val improvement before stopping; "
                              "<1 disables early stopping")
-    parser.add_argument("--sigma_min", type=float, default=0.01,
-                        help="smallest noise scale, standardized units")
-    parser.add_argument("--sigma_max", type=float, default=2.0,
-                        help="largest noise scale, standardized units")
+    parser.add_argument("--features", type=str, default="invariant",
+                        choices=["bone", "invariant"],
+                        help="energy input: bone vectors (the 2026-08-26 "
+                             "report's representation) or similarity-invariant "
+                             "log-proportions plus adjacent-bone cosines")
+    parser.add_argument("--sigma_min", type=float, default=None,
+                        help="smallest noise scale; metres for --features "
+                             "invariant, standardized units for bone. "
+                             "Defaults: 0.006 / 0.05")
+    parser.add_argument("--sigma_max", type=float, default=None,
+                        help="largest noise scale; defaults 0.25 / 2.0")
     parser.add_argument("--num_sigmas", type=int, default=12)
-    parser.add_argument("--sigma0", type=float, default=0.1,
-                        help="MDSM anchor scale in the gradient term")
+    parser.add_argument("--sigma0", type=float, default=None,
+                        help="MDSM anchor scale in the gradient term; it only "
+                             "rescales E, and gate 4 recalibrates "
+                             "energy_weight against it. Defaults: 0.05 / 0.1")
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--depth", type=int, default=3,
                         help="number of hidden layers")
@@ -283,6 +366,18 @@ if __name__ == "__main__":
     parser.add_argument("--limit_val_batches", type=int, default=0)
 
     args = parser.parse_args()
+    # Sigma lives in different units per representation, so the ladder cannot
+    # have one default. The bone defaults reproduce the 2026-08-26 report; the
+    # invariant floor starts near the 6 mm that report found necessary -- below
+    # it the near-field just memorises the training subjects' skeletons (S2.2).
+    defaults = {"bone": (0.05, 2.0, 0.1), "invariant": (0.006, 0.25, 0.05)}
+    lo, hi, s0 = defaults[args.features]
+    if args.sigma_min is None:
+        args.sigma_min = lo
+    if args.sigma_max is None:
+        args.sigma_max = hi
+    if args.sigma0 is None:
+        args.sigma0 = s0
     print(args)
     set_seed(args.seed)
     main(args)
