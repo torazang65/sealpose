@@ -1,23 +1,74 @@
-"""Unconditional DSM-trained energy prior over bone-vector coordinates.
+"""Unconditional DSM-trained energy prior over the pose.
 
 The SEAL energy net learned E(x, y) from a hinge on energy *values* at the
 finitely many (prediction, GT) pairs the run happened to visit, which leaves
 the gradient field -- the only thing the task net ever consumes -- entirely
 unconstrained (report/2026-08-19_seal_synthetic_negatives.md; the clean runs
 of 2026-08-25 confirmed E-diff grows while MPJPE stays at baseline). This
-module replaces that with an unconditional E(z) whose gradient field is the
+module replaces that with an unconditional energy whose gradient field is the
 regression target itself: multi-scale denoising score matching (MDSM, Li et
-al. 2019) over bone vectors z = By.
+al. 2019).
 
-Bone vectors rather than joint positions because the body prior is nearly
-axis-aligned there -- "femur length is constant" is a constraint on one
-3-vector's norm instead of a curved constraint tying six joint coordinates --
-and because B is linear and invertible, so p_z and p_y differ by a constant
-|det B| and Gaussian DSM in z-space is exact, no manifold corrections needed.
+Two input representations, selected per checkpoint by `features`:
+
+  "joint"  x = root-centred positions of the non-root joints, in metres, no
+           standardisation. Noise is added to these same coordinates, so the
+           corruption, the regression target sigma0^2 grad E ~ x~ - x, and
+           every diagnostic live in one space with a physical unit -- the
+           space the task net's residual lives in. This is the control the
+           later representations are measured against: whether a DSM scalar
+           energy learns at all, before any transform is put in front of it.
+
+  "bone"   z = By, per-bone offset vectors, z-scored per coordinate; noise is
+           added in the standardised space. B is linear and invertible, so
+           p_z and p_y differ by the constant |det B| and Gaussian DSM in
+           z-space is exact. The representation of the 2026-08-26 report,
+           kept so that report reproduces.
 """
 
 import torch
 import torch.nn as nn
+
+
+class RootCentered(nn.Module):
+    """x = (y - y_root) over the non-root joints, and back.
+
+    Same interface as BoneTransform: forward() drops the root (which is zero
+    after centring), compose() puts it back at the origin. Since the root
+    slot is removed rather than pinned, no noise ever lands on it. Through
+    forward() the energy is translation invariant, so its gradient w.r.t. the
+    full pose sums to zero over joints: the root receives minus the sum of
+    the others, exactly as B^T does for bone vectors.
+
+    Args:
+        parents: parent index per joint, -1 for the root.
+    """
+
+    def __init__(self, parents):
+        super(RootCentered, self).__init__()
+        parents = [int(p) for p in parents]
+        if parents.count(-1) != 1:
+            raise ValueError(f"expected exactly one root, got parents={parents}")
+        self.parents = parents
+        self.root = parents.index(-1)
+        self.num_joints = len(parents)
+        self.register_buffer("free", torch.as_tensor(
+            [j for j in range(self.num_joints) if j != self.root], dtype=torch.long))
+
+    @property
+    def dim(self):
+        return self.free.numel() * 3
+
+    def forward(self, y):
+        """(B, J, 3) or (B, J*3) joint positions -> (B, (J-1)*3) root-centred."""
+        y = y.view(y.shape[0], -1, 3)
+        return (y - y[:, self.root:self.root + 1])[:, self.free].flatten(1)
+
+    def compose(self, x):
+        """(B, (J-1)*3) -> (B, J, 3) pose with the root at the origin."""
+        out = x.new_zeros(x.shape[0], self.num_joints, 3)
+        out[:, self.free] = x.view(x.shape[0], -1, 3)
+        return out
 
 
 class BoneTransform(nn.Module):
@@ -40,6 +91,7 @@ class BoneTransform(nn.Module):
         if parents.count(-1) != 1:
             raise ValueError(f"expected exactly one root, got parents={parents}")
         self.parents = parents
+        self.root = parents.index(-1)
         self.num_joints = len(parents)
         bones = [j for j, p in enumerate(parents) if p != -1]
         index = {j: i for i, j in enumerate(bones)}
@@ -106,11 +158,11 @@ class Standardizer(nn.Module):
 
 
 class EnergyNet(nn.Module):
-    """Scalar energy over standardized bone vectors.
+    """Scalar energy over the flattened representation.
 
     Plain MLP, but with two hard requirements DSM adds over LinearLossNet:
     no dropout (a stochastic gradient field cannot be regressed) and a smooth
-    activation (a piecewise-linear net has a piecewise-constant gradient in z,
+    activation (a piecewise-linear net has a piecewise-constant gradient,
     which cannot follow the continuous regression target). No batch norm for
     the same reason train/eval gradient fields must coincide.
     """
@@ -134,13 +186,20 @@ class EnergyNet(nn.Module):
 
 
 class MultiScaleDSM(nn.Module):
-    """MDSM loss: sum_sigma l(sigma) E ||z - z~ + sigma_0^2 grad E(z~)||^2.
+    """MDSM loss: sum_sigma l(sigma) E ||x - x~ + sigma_0^2 grad E(x~)||^2.
+
+    Generic in the corrupted variable: `x` is whatever space the noise lives
+    in and `energy_fn` maps it to a scalar energy (the net itself for "joint"
+    and "bone", where the net's input is the corruption space).
 
     One sigma per sample, drawn uniformly from the ladder, so every batch
     mixes scales. l(sigma) = 1/sigma^2: the residual magnitude grows like
     sigma, so the unweighted sum would be dominated by the largest scales and
     the near-manifold field -- the part the task net lives in -- would never
-    train. sigma_0 is a single fixed anchor (the energy stays unconditional).
+    train. sigma_0 is a single fixed anchor (the energy stays unconditional);
+    the net never sees sigma, so it learns one field sigma0^2 grad E ~ x~ - x
+    for the whole mixture, and one step of exactly that size is the natural
+    denoiser -- which is what the `one_step` diagnostic measures.
 
     Pass a CPU torch.Generator to make the noise deterministic -- the
     validation loss must not jitter between evals or patience-based early
@@ -152,42 +211,82 @@ class MultiScaleDSM(nn.Module):
         self.register_buffer("sigmas", torch.as_tensor(sigmas, dtype=torch.float32))
         self.sigma0 = float(sigma0)
 
-    def forward(self, net, z_flat, generator=None, create_graph=True):
-        """Returns (loss, sigma_idx, per_sample_loss); the last two detached."""
-        batch, dim = z_flat.shape
+    def forward(self, energy_fn, x, generator=None, create_graph=True):
+        """Returns (loss, sigma_idx, diagnostics), the last two detached.
+
+        diagnostics, all per sample:
+          "loss"      the weighted DSM residual, mean of which is the loss
+          "cos"       cos(sigma0^2 grad E(x~), x~ - x): does the field point
+                      back along the corruption
+          "one_step"  ||x~ - sigma0^2 grad E - x|| / ||x~ - x||: error left
+                      after the one denoising step the objective trains for
+                      (< 1 is an improvement, 0 is perfect)
+        """
+        batch, dim = x.shape
         num_sigmas = self.sigmas.numel()
         if generator is not None:
-            idx = torch.randint(num_sigmas, (batch,), generator=generator).to(z_flat.device)
-            eps = torch.randn((batch, dim), generator=generator).to(z_flat.device)
+            idx = torch.randint(num_sigmas, (batch,), generator=generator).to(x.device)
+            eps = torch.randn((batch, dim), generator=generator).to(x.device)
         else:
-            idx = torch.randint(num_sigmas, (batch,), device=z_flat.device)
-            eps = torch.randn_like(z_flat)
+            idx = torch.randint(num_sigmas, (batch,), device=x.device)
+            eps = torch.randn_like(x)
         sigma = self.sigmas[idx].unsqueeze(1)
 
-        z_tilde = (z_flat + sigma * eps).detach().requires_grad_(True)
-        energy = net(z_tilde)
-        grad = torch.autograd.grad(energy.sum(), z_tilde, create_graph=create_graph)[0]
+        x_tilde = (x + sigma * eps).detach().requires_grad_(True)
+        energy = energy_fn(x_tilde)
+        grad = torch.autograd.grad(energy.sum(), x_tilde, create_graph=create_graph)[0]
 
-        resid = z_flat.detach() - z_tilde + (self.sigma0 ** 2) * grad
+        step = (self.sigma0 ** 2) * grad
+        resid = x.detach() - x_tilde + step
         per_sample = resid.pow(2).sum(dim=1) / sigma.squeeze(1).pow(2)
-        return per_sample.mean(), idx.detach(), per_sample.detach()
+
+        with torch.no_grad():
+            noise = (x_tilde - x).detach()
+            noise_norm = noise.norm(dim=1).clamp_min(1e-12)
+            cos = (step * noise).sum(dim=1) / (step.norm(dim=1).clamp_min(1e-12) * noise_norm)
+            one_step = resid.norm(dim=1) / noise_norm
+        diagnostics = {"loss": per_sample.detach(), "cos": cos.detach(),
+                       "one_step": one_step.detach()}
+        return per_sample.mean(), idx.detach(), diagnostics
 
 
 class EnergyPrior(nn.Module):
     """Frozen pretrained prior for task training (train_lifting --type dsm-prior).
 
-    forward(y) chains bones -> standardize -> E, so the task net's gradient is
-    B^T J_std^T grad_z E: each bone's gradient lands on its two endpoint
-    joints with opposite signs, spring-force style. The wrapper carries the
-    train-time standardizer statistics so task training cannot drift from the
-    pretraining coordinates.
+    forward(y) maps a pose to its energy through the representation the
+    checkpoint was trained with:
+
+      "joint"  E(x),                x = root-centred non-root joints, metres.
+               The task net's gradient is grad_x E on the non-root joints
+               and minus their sum on the root (translation null direction).
+      "bone"   E(std(By)),          the task net's gradient is B^T J_std^T
+               grad_z E: each bone's gradient lands on its two endpoint
+               joints with opposite signs, spring-force style.
+
+    corrupt_space / energy_at / decode expose the space the noise was added
+    to, so gates and diagnostics probe the field where it was trained
+    whichever representation is in use. The wrapper carries the train-time
+    standardizer statistics (bone only) so task training cannot drift from
+    the pretraining coordinates.
     """
 
-    def __init__(self, parents, mean, std, hidden=512, depth=3, sigmas=None, sigma0=0.1):
+    def __init__(self, parents, hidden=512, depth=3, sigmas=None, sigma0=0.1,
+                 features="joint", mean=None, std=None):
         super(EnergyPrior, self).__init__()
-        self.bones = BoneTransform(parents)
-        self.standardize = Standardizer(mean, std)
-        self.net = EnergyNet(self.bones.num_bones * 3, hidden=hidden, depth=depth)
+        if features not in ("joint", "bone"):
+            raise ValueError(f"unknown features={features!r}")
+        self.features = features
+        if features == "joint":
+            self.transform = RootCentered(parents)
+            self.standardize = None
+            in_dim = self.transform.dim
+        else:
+            if mean is None or std is None:
+                raise ValueError('features="bone" needs the standardizer mean/std')
+            self.transform = BoneTransform(parents)
+            self.standardize = Standardizer(mean, std)
+            in_dim = self.transform.num_bones * 3
+        self.net = EnergyNet(in_dim, hidden=hidden, depth=depth)
         self.register_buffer(
             "sigmas",
             torch.as_tensor(sigmas if sigmas is not None else [], dtype=torch.float32),
@@ -195,9 +294,27 @@ class EnergyPrior(nn.Module):
         self.sigma0 = float(sigma0)
         self.meta = {}
 
+    @property
+    def parents(self):
+        return self.transform.parents
+
+    def corrupt_space(self, y):
+        """Pose -> the coordinates pretraining added its noise to (= net input)."""
+        x = self.transform(y).flatten(1)
+        return x if self.standardize is None else self.standardize(x)
+
+    def energy_at(self, x):
+        """Energy of a point given in the corruption space."""
+        return self.net(x)
+
+    def decode(self, x):
+        """Inverse of corrupt_space, up to translation (root at the origin)."""
+        if self.standardize is not None:
+            x = self.standardize.inverse(x)
+        return self.transform.compose(x)
+
     def forward(self, y):
-        z = self.bones(y).flatten(1)
-        return self.net(self.standardize(z))
+        return self.energy_at(self.corrupt_space(y))
 
     def freeze(self):
         self.eval()
@@ -215,29 +332,36 @@ class EnergyPrior(nn.Module):
             )
         prior = cls(
             parents=ckpt["parents"],
-            mean=ckpt["mean"],
-            std=ckpt["std"],
             hidden=ckpt["hidden"],
             depth=ckpt["depth"],
             sigmas=ckpt["sigmas"],
             sigma0=ckpt["sigma0"],
+            # Absent in checkpoints written before the joint representation
+            # existed; those are all bone-vector priors.
+            features=ckpt.get("features", "bone"),
+            mean=ckpt.get("mean"),
+            std=ckpt.get("std"),
         )
         prior.net.load_state_dict(ckpt["net"])
         prior.meta = {k: ckpt[k] for k in ("train_args", "epoch", "val_dsm") if k in ckpt}
         return prior
 
 
-def save_energy_checkpoint(path, net, parents, mean, std, sigmas, sigma0,
-                           train_args=None, epoch=None, val_dsm=None):
+def save_energy_checkpoint(path, net, parents, sigmas, sigma0, features,
+                           mean=None, std=None, train_args=None, epoch=None,
+                           val_dsm=None):
     """Single writer for the checkpoint format EnergyPrior.load expects."""
+    if features == "bone" and (mean is None or std is None):
+        raise ValueError('features="bone" needs the standardizer mean/std')
     torch.save(
         {
             "kind": "dsm_energy_prior",
+            "features": features,
             "parents": [int(p) for p in parents],
             "hidden": net.hidden,
             "depth": net.depth,
-            "mean": torch.as_tensor(mean, dtype=torch.float32).flatten().cpu(),
-            "std": torch.as_tensor(std, dtype=torch.float32).flatten().cpu(),
+            "mean": None if mean is None else torch.as_tensor(mean, dtype=torch.float32).flatten().cpu(),
+            "std": None if std is None else torch.as_tensor(std, dtype=torch.float32).flatten().cpu(),
             "sigmas": torch.as_tensor(sigmas, dtype=torch.float32).flatten().cpu(),
             "sigma0": float(sigma0),
             "net": {k: v.cpu() for k, v in net.state_dict().items()},

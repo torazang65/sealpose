@@ -279,6 +279,27 @@ def main(args):
             return poses - poses[:, :1, :]
         return poses - (poses[:, 11:12, :] + poses[:, 12:13, :]) / 2
 
+    def prior_weight(epoch):
+        """energy_weight for this epoch under the dsm-prior schedule.
+
+        warm-up (0) -> fixed energy_weight -> linear ramp to 0 over
+        [anneal_start, anneal_end] -> 0. With no anneal the weight stays fixed
+        after warm-up. The two runs the schedule is for differ only in the
+        ramp: if the gain survives the ramp the prior changed which basin the
+        task net settled in; if it vanishes, the prior was a regulariser that
+        held the net somewhere it does not stay on its own.
+        """
+        if epoch <= args.prior_warmup:
+            return 0.0
+        if args.prior_anneal_start <= 0:
+            return args.energy_weight
+        if epoch >= args.prior_anneal_end:
+            return 0.0
+        if epoch < args.prior_anneal_start:
+            return args.energy_weight
+        span = max(args.prior_anneal_end - args.prior_anneal_start, 1)
+        return args.energy_weight * (args.prior_anneal_end - epoch) / span
+
     print("==> Data loaded...")
     device = get_device()
     if args.pos_loss == "mse":
@@ -468,9 +489,9 @@ def main(args):
                              "(pretrain one with train_energy_dsm.py)")
         energy_prior = EnergyPrior.load(args.energy_checkpoint, map_location=device)
         skeleton_parents = [int(p) for p in dataset.skeleton().parents()]
-        if energy_prior.bones.parents != skeleton_parents:
+        if energy_prior.parents != skeleton_parents:
             raise ValueError(
-                f"energy checkpoint skeleton {energy_prior.bones.parents} does not "
+                f"energy checkpoint skeleton {energy_prior.parents} does not "
                 f"match dataset skeleton {skeleton_parents}; was it pretrained "
                 f"with the same dataset and --restore_head_top?"
             )
@@ -482,6 +503,7 @@ def main(args):
             f"==> Number of parameters (loss-net): {sum(p.numel() for p in energy_prior.parameters()):,}"
         )
         print(f"==> DSM energy prior: {args.energy_checkpoint} (frozen), "
+              f"features {energy_prior.features}, "
               f"pretrain epoch {energy_prior.meta.get('epoch')}, "
               f"val DSM {energy_prior.meta.get('val_dsm')}")
 
@@ -549,6 +571,7 @@ def main(args):
         epoch_e_diff = AverageMeter()
         epoch_loss_loss_net = AverageMeter()
         e_diffs = []
+        energy_weight = prior_weight(epoch) if args.type == "dsm-prior" else args.energy_weight
         model_pos.train()
         for i, batch in enumerate(tqdm(train_loader)):
             targets_3d, inputs_2d = batch[0].to(device), batch[1].to(device)
@@ -671,11 +694,16 @@ def main(args):
                 epoch_e_diff.update(e_diff.mean().item(), batch_size)
                 e_diffs += e_diff.cpu().numpy().ravel().tolist()
 
-                loss_energy = energy_hat.mean() * args.energy_weight
+                loss_energy = energy_hat.mean() * energy_weight
                 epoch_loss_3d_pos.update(loss_3d_pos.item(), batch_size)
                 epoch_loss_energy.update(loss_energy.item(), batch_size)
 
-                loss_total = args.mse_weight * loss_3d_pos + loss_energy
+                # At weight 0 (warm-up, post-anneal) skip the prior's backward
+                # entirely so the step is exactly the baseline's, not
+                # baseline plus a zero-scaled graph.
+                loss_total = args.mse_weight * loss_3d_pos
+                if energy_weight > 0:
+                    loss_total = loss_total + loss_energy
                 optimizer.zero_grad()
                 loss_total.backward()
                 optimizer.step()
@@ -775,6 +803,7 @@ def main(args):
             if args.type != "baseline":
                 print(
                     f"  Energy loss: {epoch_loss_energy.avg:.3E}, E-diff: {epoch_e_diff.avg:.6f}, E-diff Ratio: {np.mean(e_diffs)/np.std(e_diffs):.3f}"
+                    + (f", energy_weight: {energy_weight:.3E}" if args.type == "dsm-prior" else "")
                 )
             if perturber is not None:
                 print(
@@ -833,6 +862,7 @@ def main(args):
                                 "E-diff": epoch_e_diff.avg,
                                 "E-diff-R": np.mean(e_diffs) / np.std(e_diffs),
                                 "loss_em": epoch_loss_loss_net.avg,
+                                "energy_weight": energy_weight,
                             }
                         )
                     except:
@@ -961,6 +991,17 @@ if __name__ == "__main__":
     parser.add_argument("--energy_checkpoint", type=str, default=None,
                         help="pretrained DSM energy prior for --type dsm-prior "
                              "(train_energy_dsm.py output); loaded frozen")
+    parser.add_argument("--prior_warmup", type=int, default=0,
+                        help="--type dsm-prior: epochs of pure supervised "
+                             "training before the prior term switches on; the "
+                             "early residual (~250 mm per coordinate at epoch "
+                             "1) is a random pose, not a noised one")
+    parser.add_argument("--prior_anneal_start", type=int, default=0,
+                        help="--type dsm-prior: first epoch of the linear "
+                             "ramp of energy_weight to zero; 0 keeps it fixed")
+    parser.add_argument("--prior_anneal_end", type=int, default=0,
+                        help="--type dsm-prior: epoch at which energy_weight "
+                             "reaches zero; pure supervised from then on")
     parser.add_argument("--save_path", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="h3wb")
     parser.add_argument("--task_net", type=str, default="linear")
