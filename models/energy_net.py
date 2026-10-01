@@ -24,6 +24,21 @@ Two input representations, selected per checkpoint by `features`:
            p_z and p_y differ by the constant |det B| and Gaussian DSM in
            z-space is exact. The representation of the 2026-08-26 report,
            kept so that report reproduces.
+
+  "scalebone"  E(z(x)) with z_i = b_i / s(x), b = Bx the bone vectors of the
+           root-centred pose and s(x) = mean_i |b_i| the mean bone length.
+           Noise is still added to the joint coordinates x, exactly as for
+           "joint" (same ladder, same metres), so the corruption and the
+           regression target stay in the task net's space; only the net's
+           input changes, and the DSM gradient reaches x through the chain
+           rule, grad_x E = J_z^T grad_z E. z is invariant to translation and
+           to a uniform scaling of the pose (rotation and bone proportions
+           survive), so uniform scaling is a null direction of grad_x E: the
+           prior can push the task net's pose toward a body-like *shape* but
+           never toward a body *size*. Motivation: the joint prior's -grad E
+           was spread uniformly over joints and fought the MSE (report
+           2026-09-22); removing the size degree of freedom removes one way
+           for the two to disagree.
 """
 
 import torch
@@ -132,6 +147,39 @@ class BoneTransform(nn.Module):
         for joint, parent, i in self._fk:
             out[:, joint] = out[:, parent] + z[:, i]
         return out
+
+
+class ScaledBones(nn.Module):
+    """z_i = b_i / s(x): bone vectors of a root-centred pose over their mean length.
+
+    Input is the "joint" corruption space (root-centred non-root joints,
+    flattened), so it composes after RootCentered and the noise never sees
+    it. No standardizer: dividing by s(x) already makes every bone O(1), and
+    a fixed per-coordinate z-score would put the scale back in. Not
+    invertible (s is lost by construction), so it has no compose(); decoding
+    goes through RootCentered, whose space the noise lives in.
+    """
+
+    def __init__(self, parents, eps=1e-6):
+        super(ScaledBones, self).__init__()
+        self.centred = RootCentered(parents)
+        self.bones = BoneTransform(parents)
+        self.eps = float(eps)
+
+    @property
+    def dim(self):
+        return self.bones.num_bones * 3
+
+    def forward(self, x_flat):
+        """(B, (J-1)*3) root-centred -> (B, n_bones*3) scale-normalised bones."""
+        b = self.bones(self.centred.compose(x_flat))
+        s = b.norm(dim=2).mean(dim=1, keepdim=True).clamp_min(self.eps)
+        return (b / s.unsqueeze(2)).flatten(1)
+
+    def scale(self, x_flat):
+        """s(x), the mean bone length in metres, for diagnostics."""
+        b = self.bones(self.centred.compose(x_flat))
+        return b.norm(dim=2).mean(dim=1)
 
 
 class Standardizer(nn.Module):
@@ -262,24 +310,34 @@ class EnergyPrior(nn.Module):
       "bone"   E(std(By)),          the task net's gradient is B^T J_std^T
                grad_z E: each bone's gradient lands on its two endpoint
                joints with opposite signs, spring-force style.
+      "scalebone"  E(Bx / s(x)),    x as for "joint"; the gradient is the
+               spring force of "bone" minus its projection on the uniform
+               scaling direction (the s(x) term of the chain rule).
 
     corrupt_space / energy_at / decode expose the space the noise was added
     to, so gates and diagnostics probe the field where it was trained
-    whichever representation is in use. The wrapper carries the train-time
-    standardizer statistics (bone only) so task training cannot drift from
-    the pretraining coordinates.
+    whichever representation is in use. For "scalebone" that space is the
+    joint space and energy_at applies the bone encoding itself. The wrapper
+    carries the train-time standardizer statistics (bone only) so task
+    training cannot drift from the pretraining coordinates.
     """
 
     def __init__(self, parents, hidden=512, depth=3, sigmas=None, sigma0=0.1,
                  features="joint", mean=None, std=None):
         super(EnergyPrior, self).__init__()
-        if features not in ("joint", "bone"):
+        if features not in ("joint", "bone", "scalebone"):
             raise ValueError(f"unknown features={features!r}")
         self.features = features
+        self.encode = None
         if features == "joint":
             self.transform = RootCentered(parents)
             self.standardize = None
             in_dim = self.transform.dim
+        elif features == "scalebone":
+            self.transform = RootCentered(parents)
+            self.standardize = None
+            self.encode = ScaledBones(parents)
+            in_dim = self.encode.dim
         else:
             if mean is None or std is None:
                 raise ValueError('features="bone" needs the standardizer mean/std')
@@ -305,7 +363,7 @@ class EnergyPrior(nn.Module):
 
     def energy_at(self, x):
         """Energy of a point given in the corruption space."""
-        return self.net(x)
+        return self.net(x if self.encode is None else self.encode(x))
 
     def decode(self, x):
         """Inverse of corrupt_space, up to translation (root at the origin)."""

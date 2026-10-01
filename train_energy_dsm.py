@@ -15,6 +15,11 @@ Two representations (models/energy_net.py):
                      sigma0 30 mm.
   --features bone    standardised bone vectors; ladder in standardised units,
                      defaults reproduce the 2026-08-26 report.
+  --features scalebone
+                     noise in the joint space exactly as for joint (same
+                     ladder, same metres); the net reads bone vectors over
+                     their mean length, so the energy ignores body size and
+                     the DSM gradient reaches the joints by the chain rule.
 
 Per-sigma validation diagnostics, printed every epoch alongside the loss:
 cos(sigma0^2 grad E, x~ - x) and the one-step denoising ratio. Both come out
@@ -49,7 +54,7 @@ from torch.utils.data import DataLoader
 from data.prepare_data_mpi_inf_3dhp import MpiInf3dhpDataset
 from data_loader import PoseTarget3D
 from models.energy_net import (BoneTransform, EnergyNet, MultiScaleDSM,
-                               RootCentered, Standardizer,
+                               RootCentered, ScaledBones, Standardizer,
                                save_energy_checkpoint)
 from utils.data_utils import (create_2d_data, drop_extreme_2d, fetch_h36m,
                               read_3d_data_3dhp)
@@ -59,6 +64,7 @@ from utils.utils import AverageMeter
 
 SIGMA_DEFAULTS = {          # (sigma_min, sigma_max, sigma0)
     "joint": (0.005, 0.25, 0.03),   # metres
+    "scalebone": (0.005, 0.25, 0.03),   # metres: same corruption space as joint
     "bone": (0.05, 2.0, 0.1),       # standardised units
 }
 
@@ -118,12 +124,13 @@ class PerSigma:
         return {k: v / self.count.clamp_min(1) for k, v in self.sum.items()}
 
 
-def run_epoch(loader, corrupt_space, net, dsm, optimizer=None, generator=None,
-              grad_clip=0.0, limit_batches=0, device="cpu"):
+def run_epoch(loader, corrupt_space, energy_fn, net, dsm, optimizer=None,
+              generator=None, grad_clip=0.0, limit_batches=0, device="cpu"):
     """One pass; optimizer=None means evaluation (fresh generator => same noise).
 
-    corrupt_space maps a pose batch to the coordinates the noise is added to,
-    which for both representations is also the net's input.
+    corrupt_space maps a pose batch to the coordinates the noise is added to;
+    energy_fn maps those coordinates to the energy (the net itself for joint
+    and bone, encoding followed by the net for scalebone).
     """
     meter = AverageMeter()
     per_sigma = PerSigma(dsm.sigmas.numel(), ("loss", "cos", "one_step"))
@@ -132,7 +139,7 @@ def run_epoch(loader, corrupt_space, net, dsm, optimizer=None, generator=None,
     for i, y in enumerate(loader):
         y = y.to(device)
         x = corrupt_space(y)
-        loss, idx, diagnostics = dsm(net, x, generator=generator,
+        loss, idx, diagnostics = dsm(energy_fn, x, generator=generator,
                                      create_graph=training)
         if training:
             optimizer.zero_grad()
@@ -203,7 +210,8 @@ def main(args):
         np.log10(args.sigma_min), np.log10(args.sigma_max), args.num_sigmas
     )
     mean = std = None
-    if args.features == "joint":
+    encode = None
+    if args.features in ("joint", "scalebone"):
         transform = RootCentered(parents).to(device)
         corrupt_space = transform
         in_dim = transform.dim
@@ -215,6 +223,22 @@ def main(args):
         print(f"==> Sigma ladder (mm): "
               f"{[round(s * 1000, 1) for s in sigmas.tolist()]}, "
               f"sigma0 {args.sigma0 * 1000:.1f} mm")
+        if args.features == "scalebone":
+            encode = ScaledBones(parents).to(device)
+            in_dim = encode.dim
+            # The size the energy is blind to, and the spread of the input it
+            # does see, so the ladder can be read in z units too.
+            with torch.no_grad():
+                s_mean, s_std = coordinate_statistics(
+                    poses_train, lambda y: encode.scale(transform(y)).unsqueeze(1),
+                    device)
+                _, z_spread = coordinate_statistics(
+                    poses_train, lambda y: encode(transform(y)), device)
+            print(f"==> Net input: {in_dim} scale-normalised bone coordinates; "
+                  f"mean bone length s(x) (m): {s_mean.item():.4f} "
+                  f"+- {s_std.item():.4f}")
+            print(f"==> z coordinate std: min {z_spread.min():.4f}, "
+                  f"median {z_spread.median():.4f}, max {z_spread.max():.4f}")
     else:
         transform = BoneTransform(parents).to(device)
         in_dim = transform.num_bones * 3
@@ -233,6 +257,7 @@ def main(args):
 
     dsm = MultiScaleDSM(sigmas, args.sigma0).to(device)
     net = EnergyNet(in_dim, hidden=args.hidden, depth=args.depth).to(device)
+    energy_fn = net if encode is None else (lambda x: net(encode(x)))
     print(f"==> Number of parameters (energy net): "
           f"{sum(p.numel() for p in net.parameters()):,}")
     if args.weight_decay > 0:
@@ -256,7 +281,7 @@ def main(args):
     start_time = time.time()
     for epoch in range(1, args.num_epoch + 1):
         train_loss, train_stats = run_epoch(
-            train_loader, corrupt_space, net, dsm,
+            train_loader, corrupt_space, energy_fn, net, dsm,
             optimizer=optimizer, grad_clip=args.grad_clip,
             limit_batches=args.limit_train_batches, device=device,
         )
@@ -266,7 +291,7 @@ def main(args):
             # so patience reacts to the model, not to the noise draw.
             generator = torch.Generator().manual_seed(args.seed + 10000)
             val_loss, val_stats = run_epoch(
-                val_loader, corrupt_space, net, dsm,
+                val_loader, corrupt_space, energy_fn, net, dsm,
                 optimizer=None, generator=generator,
                 limit_batches=args.limit_val_batches, device=device,
             )
@@ -332,14 +357,16 @@ if __name__ == "__main__":
                         help="epochs without val improvement before stopping; "
                              "<1 disables early stopping")
     parser.add_argument("--features", type=str, default="joint",
-                        choices=["joint", "bone"],
-                        help="energy input: root-centred joints in metres, or "
+                        choices=["joint", "bone", "scalebone"],
+                        help="energy input: root-centred joints in metres, "
                              "standardised bone vectors (the 2026-08-26 "
-                             "report's representation)")
+                             "report's representation), or bone vectors over "
+                             "their mean length with the noise still in the "
+                             "joint space")
     parser.add_argument("--sigma_min", type=float, default=None,
-                        help="smallest noise scale; metres for joint, "
-                             "standardised units for bone. Defaults: "
-                             "0.005 / 0.05")
+                        help="smallest noise scale; metres for joint and "
+                             "scalebone, standardised units for bone. "
+                             "Defaults: 0.005 / 0.05")
     parser.add_argument("--sigma_max", type=float, default=None,
                         help="largest noise scale; defaults 0.25 / 2.0")
     parser.add_argument("--num_sigmas", type=int, default=12)
